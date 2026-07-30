@@ -83,6 +83,13 @@ var REGION = ee.Geometry.Rectangle([72, 20, 76, 24]);
 var GEDI_COLLECTION_ID = 'LARSE/GEDI/GEDI04_A_002';
 var S2_COLLECTION_ID = 'COPERNICUS/S2_SR_HARMONIZED';
 
+// Cloud Score+ replaces QA60 for cloud masking (see section 2 below for
+// why). CS_PLUS_CLEAR_THRESHOLD follows Google's own guidance for the
+// cs_cdf band: >= 0.6 is a reasonable default "clear" cutoff.
+var CS_PLUS_COLLECTION_ID = 'GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED';
+var CS_PLUS_BAND = 'cs_cdf';
+var CS_PLUS_CLEAR_THRESHOLD = 0.6;
+
 // Stratified sampling to fix the region's biomass imbalance (median ~4
 // Mg/ha, 90th percentile ~39 Mg/ha — see header). Shots below
 // BIOMASS_THRESHOLD_MG_HA are randomly subsampled down to
@@ -249,13 +256,18 @@ for (var d = 0; d < DISTRIBUTION_BAND_EDGES.length - 1; d++) {
 // 2. Sentinel-2: cloud masking, indices, and time-matched seasonal composites
 // =============================================================================
 
+// QA60-based masking was dropped: in Sentinel-2's newer processing baseline
+// (roughly post-2022), QA60 is often all-zero, so clouds pass straight
+// through unmasked. Since GEDI shots run to 2024, that would have silently
+// contaminated a large share of the training features with unmasked cloud
+// pixels. Cloud Score+ gives a per-pixel ML-based clear-sky probability
+// (cs_cdf) instead, joined to each S2 scene by system:index via
+// linkCollection. (If this join ever proves awkward, the documented
+// fallback is the SCL band, excluding classes 3/8/9/10/11 — cloud shadow,
+// cloud medium/high probability, thin cirrus, and snow/ice.)
 function maskS2Clouds(image) {
-  var qa = image.select('QA60');
-  var cloudBitMask = 1 << 10;
-  var cirrusBitMask = 1 << 11;
-  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
-    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
-  return image.updateMask(mask)
+  var clearMask = image.select(CS_PLUS_BAND).gte(CS_PLUS_CLEAR_THRESHOLD);
+  return image.updateMask(clearMask)
     .select(S2_BANDS)
     .multiply(0.0001) // scale digital numbers to reflectance fraction
     .copyProperties(image, ['system:time_start']);
@@ -272,12 +284,21 @@ function addIndices(image) {
   return image.addBands([ndvi, evi]);
 }
 
-function seasonalMedian(region, start, end) {
-  return ee.ImageCollection(S2_COLLECTION_ID)
+// label identifies the seasonal window in the Console (e.g. "2021
+// post-monsoon"). Prints the scene count BEFORE compositing/masking, so an
+// empty window is visible immediately rather than silently producing a
+// blank (fully masked) composite that would drop that year's shots from
+// the export with no warning.
+function seasonalMedian(region, start, end, label) {
+  var s2 = ee.ImageCollection(S2_COLLECTION_ID)
     .filterBounds(region)
-    .filterDate(start, end)
-    .map(maskS2Clouds)
-    .median();
+    .filterDate(start, end);
+  var csPlus = ee.ImageCollection(CS_PLUS_COLLECTION_ID);
+  var s2WithCs = s2.linkCollection(csPlus, [CS_PLUS_BAND]);
+
+  print('Sentinel-2 scenes, ' + label + ':', s2WithCs.size());
+
+  return s2WithCs.map(maskS2Clouds).median();
 }
 
 // var canopyHeight = ee.Image(CANOPY_HEIGHT_ASSET_ID).select(0).rename('canopy_height');
@@ -287,15 +308,20 @@ function seasonalMedian(region, start, end) {
 // composite pair per calendar year present in the GEDI data, rather than one
 // composite per individual shot — far cheaper, and every shot still lands
 // within ~6 months of its matched window (see season_year tagging above).
+// y is a plain JS number (see the client-side years loop below), not an
+// ee.Number — needed so the per-season scene-count prints in
+// seasonalMedian actually fire once per year instead of once for the whole
+// (server-side-mapped) computation graph.
 function seasonalComposites(y) {
-  y = ee.Number(y);
   var postMonsoonStart = ee.Date.fromYMD(y, 10, 1);
   var postMonsoonEnd = ee.Date.fromYMD(y, 12, 31);
-  var dryStart = ee.Date.fromYMD(y.add(1), 1, 1);
-  var dryEnd = ee.Date.fromYMD(y.add(1), 3, 31);
+  var dryStart = ee.Date.fromYMD(y + 1, 1, 1);
+  var dryEnd = ee.Date.fromYMD(y + 1, 3, 31);
 
-  var postMonsoon = addIndices(seasonalMedian(REGION, postMonsoonStart, postMonsoonEnd));
-  var dry = addIndices(seasonalMedian(REGION, dryStart, dryEnd));
+  var postMonsoon = addIndices(seasonalMedian(
+    REGION, postMonsoonStart, postMonsoonEnd, y + ' post-monsoon (Oct-Dec)'));
+  var dry = addIndices(seasonalMedian(
+    REGION, dryStart, dryEnd, y + ' dry-season (Jan-Mar ' + (y + 1) + ')'));
 
   var postMonsoonIndices = postMonsoon.select(['NDVI', 'EVI'], ['ndvi_postmonsoon', 'evi_postmonsoon']);
   var dryIndices = dry.select(['NDVI', 'EVI'], ['ndvi_dryseason', 'evi_dryseason']);
@@ -318,7 +344,17 @@ var startYear = ee.Algorithms.If(
   minShotDate.get('month').gte(7), minShotDate.get('year'), minShotDate.get('year').subtract(1));
 var endYear = ee.Algorithms.If(
   maxShotDate.get('month').gte(7), maxShotDate.get('year'), maxShotDate.get('year').subtract(1));
-var years = ee.List.sequence(startYear, endYear);
+
+// Pulled down as plain JS numbers (one blocking round trip) so the loop
+// below runs client-side — required for the per-season scene-count prints
+// in seasonalMedian to fire once per year/season rather than once for the
+// whole server-side computation graph (an ee.List.map() callback can't
+// produce per-iteration Console output).
+var seasonYearRange = ee.List([startYear, endYear]).getInfo();
+var years = [];
+for (var yr = seasonYearRange[0]; yr <= seasonYearRange[1]; yr++) {
+  years.push(yr);
+}
 
 print('Season years covered:', years);
 
@@ -329,7 +365,6 @@ var yearlyComposites = ee.ImageCollection(years.map(seasonalComposites));
 // =============================================================================
 
 var trainingByYear = years.map(function(y) {
-  y = ee.Number(y);
   var shotsThisYear = gediShots.filter(ee.Filter.eq('season_year', y));
   var composite = ee.Image(yearlyComposites.filter(ee.Filter.eq('season_year', y)).first());
   return composite.sampleRegions({
