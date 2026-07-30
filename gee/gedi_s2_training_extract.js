@@ -30,9 +30,12 @@
  * most of the region is dryland/cropland/urban rather than forest. A naive
  * random sample of the ~3.6M quality shots would be almost entirely
  * near-zero biomass and would starve a model of the high-biomass (tree)
- * signal it needs. So this script applies STRATIFIED sampling: every shot
- * at or above a biomass threshold is kept, and the low-biomass majority is
- * randomly subsampled down to a comparable, manageable size (see CONFIG).
+ * signal it needs. So this script applies STRATIFIED sampling on both
+ * ends: the low-biomass majority is randomly subsampled down to a
+ * manageable size, AND the high-biomass tier is split into bands (most
+ * high shots cluster at 20-40 Mg/ha, very few above 120) with its own
+ * per-band cap, so neither the near-zero majority nor the common
+ * mid-high band can crowd out the rare dense-canopy shots (see CONFIG).
  *
  * Output: one CSV row per sampled quality GEDI shot, columns = agbd,
  * agbd_se, GEDI shot date, lat, lon, GEDI's own covariates (sensitivity,
@@ -81,13 +84,26 @@ var GEDI_COLLECTION_ID = 'LARSE/GEDI/GEDI04_A_002';
 var S2_COLLECTION_ID = 'COPERNICUS/S2_SR_HARMONIZED';
 
 // Stratified sampling to fix the region's biomass imbalance (median ~4
-// Mg/ha, 90th percentile ~39 Mg/ha — see header). Every shot at or above
-// this threshold is kept in full; everything below it is randomly
-// subsampled down to LOW_BIOMASS_SAMPLE_SIZE rows so near-zero shots don't
-// swamp the training set.
+// Mg/ha, 90th percentile ~39 Mg/ha — see header). Shots below
+// BIOMASS_THRESHOLD_MG_HA are randomly subsampled down to
+// LOW_BIOMASS_SAMPLE_SIZE; shots at or above it are split into bands and
+// each band is capped at its own target, so the training set is balanced
+// in both directions instead of swamped by near-zero OR dominated by the
+// most common high-biomass band.
 var BIOMASS_THRESHOLD_MG_HA = 20; // high/low split; ~90th percentile is 39 Mg/ha, so this keeps essentially all real tree signal
 var LOW_BIOMASS_SAMPLE_SIZE = 30000; // target row count for the random low-biomass subsample
-var RANDOM_SEED = 42; // fixed seed so the low-biomass subsample is reproducible across runs
+var HIGH_BIOMASS_SAMPLE_SIZE = 30000; // total target across all high-biomass bands combined, matching the low tier
+
+// Most high-biomass shots cluster at 20-40 Mg/ha with very few above 120;
+// a flat cap on the whole high tier would be dominated by 20-40 Mg/ha
+// shots and lose the dense-canopy upper range. Splitting into bands and
+// giving each an equal share of HIGH_BIOMASS_SAMPLE_SIZE keeps the rare,
+// most valuable dense-canopy shots from being crowded out — a band with
+// fewer real shots than its target just keeps everything it has.
+var HIGH_BIOMASS_BAND_EDGES = [20, 40, 70, 120, Infinity]; // Mg/ha; edit to change bands
+var HIGH_BAND_TARGET = Math.floor(HIGH_BIOMASS_SAMPLE_SIZE / (HIGH_BIOMASS_BAND_EDGES.length - 1));
+
+var RANDOM_SEED = 42; // fixed seed so the subsamples are reproducible across runs
 
 // Surface-reflectance bands to export. B10 is intentionally excluded: it is
 // an L1C-only cirrus-detection band and does not exist in the L2A (SR)
@@ -168,21 +184,54 @@ print('GEDI shot date range:',
 
 // -----------------------------------------------------------------------
 // Stratified sampling — fixes the region's biomass imbalance (see header
-// and CONFIG). Keep every high-biomass shot; randomly subsample the rest.
+// and CONFIG): subsample the low-biomass majority, and cap each
+// high-biomass band separately so dense-canopy shots aren't crowded out
+// by the far more common 20-40 Mg/ha band.
 // -----------------------------------------------------------------------
-var highBiomassShots = gediShots.filter(ee.Filter.gte('agbd', BIOMASS_THRESHOLD_MG_HA));
-
 var lowBiomassShots = gediShots
   .filter(ee.Filter.lt('agbd', BIOMASS_THRESHOLD_MG_HA))
   .randomColumn('random', RANDOM_SEED)
   .sort('random')
   .limit(LOW_BIOMASS_SAMPLE_SIZE);
 
+var highBiomassBands = [];
+for (var i = 0; i < HIGH_BIOMASS_BAND_EDGES.length - 1; i++) {
+  var bandLo = HIGH_BIOMASS_BAND_EDGES[i];
+  var bandHi = HIGH_BIOMASS_BAND_EDGES[i + 1];
+  var bandFilter = isFinite(bandHi)
+    ? ee.Filter.and(ee.Filter.gte('agbd', bandLo), ee.Filter.lt('agbd', bandHi))
+    : ee.Filter.gte('agbd', bandLo);
+  var bandShots = gediShots
+    .filter(bandFilter)
+    .randomColumn('random', RANDOM_SEED + i) // vary seed per band
+    .sort('random')
+    .limit(HIGH_BAND_TARGET);
+  print('High-biomass band ' + bandLo + '-' + (isFinite(bandHi) ? bandHi : 'inf') +
+    ' Mg/ha sampled to (of target ' + HIGH_BAND_TARGET + '):', bandShots.size());
+  highBiomassBands.push(bandShots);
+}
+var highBiomassShots = ee.FeatureCollection(highBiomassBands).flatten();
+
 gediShots = highBiomassShots.merge(lowBiomassShots);
 
-print('High-biomass shots kept (>= ' + BIOMASS_THRESHOLD_MG_HA + ' Mg/ha):', highBiomassShots.size());
 print('Low-biomass shots subsampled to:', lowBiomassShots.size());
+print('High-biomass shots kept (all bands):', highBiomassShots.size());
 print('Total shots after stratified sampling:', gediShots.size());
+
+// -----------------------------------------------------------------------
+// Final training-set biomass distribution — a shape check before the
+// (much more expensive) Sentinel-2 matching and export below.
+// -----------------------------------------------------------------------
+var DISTRIBUTION_BAND_EDGES = [0, 5, 20, 40, 70, 120, Infinity]; // Mg/ha
+for (var d = 0; d < DISTRIBUTION_BAND_EDGES.length - 1; d++) {
+  var distLo = DISTRIBUTION_BAND_EDGES[d];
+  var distHi = DISTRIBUTION_BAND_EDGES[d + 1];
+  var distFilter = isFinite(distHi)
+    ? ee.Filter.and(ee.Filter.gte('agbd', distLo), ee.Filter.lt('agbd', distHi))
+    : ee.Filter.gte('agbd', distLo);
+  var distLabel = distLo + '-' + (isFinite(distHi) ? distHi : '+') + ' Mg/ha';
+  print('Final training shots, ' + distLabel + ':', gediShots.filter(distFilter).size());
+}
 
 // =============================================================================
 // 2. Sentinel-2: cloud masking, indices, and time-matched seasonal composites
