@@ -100,7 +100,10 @@ var HIGH_BIOMASS_SAMPLE_SIZE = 30000; // total target across all high-biomass ba
 // giving each an equal share of HIGH_BIOMASS_SAMPLE_SIZE keeps the rare,
 // most valuable dense-canopy shots from being crowded out — a band with
 // fewer real shots than its target just keeps everything it has.
-var HIGH_BIOMASS_BAND_EDGES = [20, 40, 70, 120, Infinity]; // Mg/ha; edit to change bands
+// First edge is tied to BIOMASS_THRESHOLD_MG_HA (not re-hardcoded) so the
+// low tier and the high tier's first band can never drift apart into an
+// overlap or a gap.
+var HIGH_BIOMASS_BAND_EDGES = [BIOMASS_THRESHOLD_MG_HA, 40, 70, 120, Infinity]; // Mg/ha; edit to change bands
 var HIGH_BAND_TARGET = Math.floor(HIGH_BIOMASS_SAMPLE_SIZE / (HIGH_BIOMASS_BAND_EDGES.length - 1));
 
 var RANDOM_SEED = 42; // fixed seed so the subsamples are reproducible across runs
@@ -187,9 +190,18 @@ print('GEDI shot date range:',
 // and CONFIG): subsample the low-biomass majority, and cap each
 // high-biomass band separately so dense-canopy shots aren't crowded out
 // by the far more common 20-40 Mg/ha band.
+//
+// lowOnlyShots (agbd < BIOMASS_THRESHOLD_MG_HA) and highOnlyShots
+// (agbd >= BIOMASS_THRESHOLD_MG_HA) partition the quality-filtered shots
+// exactly, with no gap and no overlap at the threshold. The low subsample
+// and every high band are filtered from these two disjoint collections
+// (never from the unsplit gediShots), so no single shot can ever be drawn
+// into both tiers.
 // -----------------------------------------------------------------------
-var lowBiomassShots = gediShots
-  .filter(ee.Filter.lt('agbd', BIOMASS_THRESHOLD_MG_HA))
+var lowOnlyShots = gediShots.filter(ee.Filter.lt('agbd', BIOMASS_THRESHOLD_MG_HA));
+var highOnlyShots = gediShots.filter(ee.Filter.gte('agbd', BIOMASS_THRESHOLD_MG_HA));
+
+var lowBiomassShots = lowOnlyShots
   .randomColumn('random', RANDOM_SEED)
   .sort('random')
   .limit(LOW_BIOMASS_SAMPLE_SIZE);
@@ -201,7 +213,7 @@ for (var i = 0; i < HIGH_BIOMASS_BAND_EDGES.length - 1; i++) {
   var bandFilter = isFinite(bandHi)
     ? ee.Filter.and(ee.Filter.gte('agbd', bandLo), ee.Filter.lt('agbd', bandHi))
     : ee.Filter.gte('agbd', bandLo);
-  var bandShots = gediShots
+  var bandShots = highOnlyShots
     .filter(bandFilter)
     .randomColumn('random', RANDOM_SEED + i) // vary seed per band
     .sort('random')
