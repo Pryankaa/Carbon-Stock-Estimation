@@ -66,6 +66,17 @@
  *     in CLAUDE.md about validating GEDI before trusting it elsewhere).
  */
 
+// -----------------------------------------------------------------------
+// PERFORMANCE NOTE: this script is intentionally quiet in the Console. The
+// region has ~3.6M quality GEDI shots — evaluating that collection for a
+// live print (a .size(), a full reduce, a per-band or distribution scan)
+// is enough on its own to make the Code Editor unresponsive. Everything
+// below stays lazy; the heavy work only actually runs once, inside the
+// Export.table.toDrive task. To inspect the biomass distribution and shot
+// counts, do it AFTER exporting — load the CSV in Python (Claude Code can
+// do this) rather than adding print()s here.
+// -----------------------------------------------------------------------
+
 // =============================================================================
 // 0. CONFIG — placeholders to replace with real values before running
 // =============================================================================
@@ -92,6 +103,13 @@ var REGION = ee.Geometry.Rectangle([72, 20, 76, 24]);
 // checkpoint used. Coverage is March 2019 - March 2023 only (see header).
 var GEDI_COLLECTION_ID = 'LARSE/GEDI/GEDI04_A_002_MONTHLY';
 var S2_COLLECTION_ID = 'COPERNICUS/S2_SR_HARMONIZED';
+
+// Hardcoded to match GEDI04_A_002_MONTHLY's actual coverage (March 2019 -
+// March 2023) instead of computing it from the shot collection's min/max
+// date — that would require a .getInfo() round trip over the full ~3.6M
+// shot collection just to find the range, which is itself slow enough to
+// hang the Code Editor.
+var SEASON_YEARS = [2019, 2020, 2021, 2022, 2023];
 
 // Cloud Score+ replaces QA60 for cloud masking (see section 2 below for
 // why). CS_PLUS_CLEAR_THRESHOLD follows Google's own guidance for the
@@ -132,6 +150,17 @@ var S2_BANDS = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B
 
 var EXPORT_FOLDER = 'carbon_stock_estimation';
 var EXPORT_FILE_PREFIX = 'gedi_l4a_s2_training_gujarat_maharashtra';
+
+// The only two prints in this script — both cheap: REGION is a small
+// client-side geometry, and the rest are plain JS config values, so
+// neither touches the GEDI shot collection or triggers any server
+// computation.
+print('Region:', REGION);
+print('Config — biomass threshold (Mg/ha):', BIOMASS_THRESHOLD_MG_HA,
+  '| low-tier sample size:', LOW_BIOMASS_SAMPLE_SIZE,
+  '| high-tier sample size:', HIGH_BIOMASS_SAMPLE_SIZE,
+  '| high-tier bands (Mg/ha):', HIGH_BIOMASS_BAND_EDGES,
+  '| season years:', SEASON_YEARS);
 
 // =============================================================================
 // 1. GEDI L4A footprint-level shots, quality-filtered
@@ -199,17 +228,12 @@ gediShots = gediShots.map(function(f) {
   });
 });
 
-// -----------------------------------------------------------------------
-// CHECKPOINT — inspect these two prints before proceeding to the (much
-// more expensive) Sentinel-2 matching and export below.
-// -----------------------------------------------------------------------
-print('Total quality GEDI L4A shots in region:', gediShots.size());
-
-var shotDatesMillis = gediShots.aggregate_array('shot_date_millis');
-var minShotDate = ee.Date(shotDatesMillis.reduce(ee.Reducer.min()));
-var maxShotDate = ee.Date(shotDatesMillis.reduce(ee.Reducer.max()));
-print('GEDI shot date range:',
-  minShotDate.format('YYYY-MM-dd'), 'to', maxShotDate.format('YYYY-MM-dd'));
+// No shot-count/date-range checkpoint here anymore: .size() and any
+// reduce() over gediShots (~3.6M features) forces a full server
+// computation for the Console and is what was hanging the Code Editor.
+// SEASON_YEARS above is hardcoded from the known asset coverage instead of
+// derived from the data. Check shot counts and date coverage from the
+// exported CSV instead (see PERFORMANCE NOTE at the top of this file).
 
 // -----------------------------------------------------------------------
 // Stratified sampling — fixes the region's biomass imbalance (see header
@@ -244,32 +268,20 @@ for (var i = 0; i < HIGH_BIOMASS_BAND_EDGES.length - 1; i++) {
     .randomColumn('random', RANDOM_SEED + i) // vary seed per band
     .sort('random')
     .limit(HIGH_BAND_TARGET);
-  print('High-biomass band ' + bandLo + '-' + (isFinite(bandHi) ? bandHi : 'inf') +
-    ' Mg/ha sampled to (of target ' + HIGH_BAND_TARGET + '):', bandShots.size());
+  // No per-band print here: .size() on these filtered collections still
+  // forces a server computation per band, which is exactly what was
+  // hanging the Code Editor. Inspect the sampled distribution from the
+  // exported CSV instead (see PERFORMANCE NOTE at the top of this file).
   highBiomassBands.push(bandShots);
 }
 var highBiomassShots = ee.FeatureCollection(highBiomassBands).flatten();
 
 gediShots = highBiomassShots.merge(lowBiomassShots);
 
-print('Low-biomass shots subsampled to:', lowBiomassShots.size());
-print('High-biomass shots kept (all bands):', highBiomassShots.size());
-print('Total shots after stratified sampling:', gediShots.size());
-
-// -----------------------------------------------------------------------
-// Final training-set biomass distribution — a shape check before the
-// (much more expensive) Sentinel-2 matching and export below.
-// -----------------------------------------------------------------------
-var DISTRIBUTION_BAND_EDGES = [0, 5, 20, 40, 70, 120, Infinity]; // Mg/ha
-for (var d = 0; d < DISTRIBUTION_BAND_EDGES.length - 1; d++) {
-  var distLo = DISTRIBUTION_BAND_EDGES[d];
-  var distHi = DISTRIBUTION_BAND_EDGES[d + 1];
-  var distFilter = isFinite(distHi)
-    ? ee.Filter.and(ee.Filter.gte('agbd', distLo), ee.Filter.lt('agbd', distHi))
-    : ee.Filter.gte('agbd', distLo);
-  var distLabel = distLo + '-' + (isFinite(distHi) ? distHi : '+') + ' Mg/ha';
-  print('Final training shots, ' + distLabel + ':', gediShots.filter(distFilter).size());
-}
+// No count/distribution prints here either — same reason. The whole point
+// of this restructuring is that gediShots stays an unevaluated, lazy
+// FeatureCollection all the way through the Sentinel-2 matching below; it
+// only actually gets computed once, inside the export task.
 
 // =============================================================================
 // 2. Sentinel-2: cloud masking, indices, and time-matched seasonal composites
@@ -304,19 +316,18 @@ function addIndices(image) {
   return image.addBands([ndvi, evi]);
 }
 
-// label identifies the seasonal window in the Console (e.g. "2021
-// post-monsoon"). Prints the scene count BEFORE compositing/masking, so an
-// empty window is visible immediately rather than silently producing a
-// blank (fully masked) composite that would drop that year's shots from
-// the export with no warning.
-function seasonalMedian(region, start, end, label) {
+// No scene-count print here: an empty seasonal window (zero S2 scenes)
+// used to be caught by printing s2WithCs.size() per season, but that's a
+// live server computation per call — with SEASON_YEARS x 2 seasons that's
+// 10 of them, which is exactly the kind of interactive cost this rewrite
+// removes. If a season silently has zero scenes, its shots will be absent
+// from that year in the exported CSV — check season/year coverage there.
+function seasonalMedian(region, start, end) {
   var s2 = ee.ImageCollection(S2_COLLECTION_ID)
     .filterBounds(region)
     .filterDate(start, end);
   var csPlus = ee.ImageCollection(CS_PLUS_COLLECTION_ID);
   var s2WithCs = s2.linkCollection(csPlus, [CS_PLUS_BAND]);
-
-  print('Sentinel-2 scenes, ' + label + ':', s2WithCs.size());
 
   return s2WithCs.map(maskS2Clouds).median();
 }
@@ -328,20 +339,15 @@ function seasonalMedian(region, start, end, label) {
 // composite pair per calendar year present in the GEDI data, rather than one
 // composite per individual shot — far cheaper, and every shot still lands
 // within ~6 months of its matched window (see season_year tagging above).
-// y is a plain JS number (see the client-side years loop below), not an
-// ee.Number — needed so the per-season scene-count prints in
-// seasonalMedian actually fire once per year instead of once for the whole
-// (server-side-mapped) computation graph.
+// y is a plain JS number from SEASON_YEARS below, not an ee.Number.
 function seasonalComposites(y) {
   var postMonsoonStart = ee.Date.fromYMD(y, 10, 1);
   var postMonsoonEnd = ee.Date.fromYMD(y, 12, 31);
   var dryStart = ee.Date.fromYMD(y + 1, 1, 1);
   var dryEnd = ee.Date.fromYMD(y + 1, 3, 31);
 
-  var postMonsoon = addIndices(seasonalMedian(
-    REGION, postMonsoonStart, postMonsoonEnd, y + ' post-monsoon (Oct-Dec)'));
-  var dry = addIndices(seasonalMedian(
-    REGION, dryStart, dryEnd, y + ' dry-season (Jan-Mar ' + (y + 1) + ')'));
+  var postMonsoon = addIndices(seasonalMedian(REGION, postMonsoonStart, postMonsoonEnd));
+  var dry = addIndices(seasonalMedian(REGION, dryStart, dryEnd));
 
   var postMonsoonIndices = postMonsoon.select(['NDVI', 'EVI'], ['ndvi_postmonsoon', 'evi_postmonsoon']);
   var dryIndices = dry.select(['NDVI', 'EVI'], ['ndvi_dryseason', 'evi_dryseason']);
@@ -357,34 +363,16 @@ function seasonalComposites(y) {
     .set('season_year', y);
 }
 
-// Same Jul-Dec / Jan-Jun season-year rule as the per-shot tagging above,
-// applied to the min/max shot dates to get the full range of season years
-// actually present in the data.
-var startYear = ee.Algorithms.If(
-  minShotDate.get('month').gte(7), minShotDate.get('year'), minShotDate.get('year').subtract(1));
-var endYear = ee.Algorithms.If(
-  maxShotDate.get('month').gte(7), maxShotDate.get('year'), maxShotDate.get('year').subtract(1));
-
-// Pulled down as plain JS numbers (one blocking round trip) so the loop
-// below runs client-side — required for the per-season scene-count prints
-// in seasonalMedian to fire once per year/season rather than once for the
-// whole server-side computation graph (an ee.List.map() callback can't
-// produce per-iteration Console output).
-var seasonYearRange = ee.List([startYear, endYear]).getInfo();
-var years = [];
-for (var yr = seasonYearRange[0]; yr <= seasonYearRange[1]; yr++) {
-  years.push(yr);
-}
-
-print('Season years covered:', years);
-
-var yearlyComposites = ee.ImageCollection(years.map(seasonalComposites));
+// SEASON_YEARS (CONFIG, top of file) is hardcoded from GEDI04_A_002_MONTHLY's
+// known coverage — no min/max reduce over gediShots and no .getInfo() round
+// trip needed to find the range.
+var yearlyComposites = ee.ImageCollection(SEASON_YEARS.map(seasonalComposites));
 
 // =============================================================================
 // 3. Sample Sentinel-2 at each GEDI shot, matched by year
 // =============================================================================
 
-var trainingByYear = years.map(function(y) {
+var trainingByYear = SEASON_YEARS.map(function(y) {
   var shotsThisYear = gediShots.filter(ee.Filter.eq('season_year', y));
   var composite = ee.Image(yearlyComposites.filter(ee.Filter.eq('season_year', y)).first());
   return composite.sampleRegions({
