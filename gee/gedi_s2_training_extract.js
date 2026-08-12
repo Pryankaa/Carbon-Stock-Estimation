@@ -78,22 +78,43 @@
 
 // -----------------------------------------------------------------------
 // PERFORMANCE NOTE: this script is intentionally quiet in the Console. The
-// region has ~3.6M quality GEDI shots — evaluating that collection for a
-// live print (a .size(), a full reduce, a per-band or distribution scan)
-// is enough on its own to make the Code Editor unresponsive. Everything
-// below stays lazy; the heavy work only actually runs once, inside the
-// Export.table.toDrive task. To inspect the biomass distribution and shot
-// counts, do it AFTER exporting — load the CSV in Python (Claude Code can
-// do this) rather than adding print()s here.
+// full region has ~3.6M quality GEDI shots — evaluating that collection
+// for a live print (a .size(), a full reduce, a per-band or distribution
+// scan) is enough on its own to make the Code Editor unresponsive.
+// Everything below stays lazy; the heavy work only actually runs once,
+// inside the Export.table.toDrive task. To inspect the biomass
+// distribution and shot counts, do it AFTER exporting — load the CSV in
+// Python (Claude Code can do this) rather than adding print()s here. The
+// one exception is the capped TEST_MODE row-count check right before the
+// export (section 4) — see TEST_MODE above.
 // -----------------------------------------------------------------------
 
 // =============================================================================
 // 0. CONFIG — placeholders to replace with real values before running
 // =============================================================================
 
+// TEST_MODE: fail-fast check on a small, known-vegetated area before
+// burning a long run on the full region. When true, REGION below is
+// overridden with a 0.3 deg box in the Western Ghats (real forest, plenty
+// of GEDI shots expected) and the ONE interactive print near the export
+// at the bottom is enabled.
+//
+// Workflow: run with TEST_MODE = true, confirm "TEST row count" in the
+// Console is > 0, THEN set TEST_MODE = false and start the real export
+// task. Leave TEST_MODE = false for the real regional export — the test
+// print is gated on it and won't fire (or hang the UI) once it's off.
+var TEST_MODE = true;
+
 // Placeholder region: Gujarat/Maharashtra, ~20-24 N, 72-76 E.
 // Replace with the real regional bounding box before running.
 var REGION = ee.Geometry.Rectangle([72, 20, 76, 24]);
+
+if (TEST_MODE) {
+  // Small box in the Western Ghats — real forest, should return a
+  // nonzero row count quickly without evaluating the full ~3.6M-shot
+  // region.
+  REGION = ee.Geometry.Rectangle([73.0, 20.0, 73.3, 20.3]);
+}
 
 // TODO(height strategy): external canopy-height sampling is disabled. The
 // candidate asset ID below is unverified (unconfirmed in this environment),
@@ -399,6 +420,18 @@ var training = seasonalComposite.sampleRegions({
 // =============================================================================
 // 4. Export training CSV to Drive
 // =============================================================================
+
+// The ONE interactive evaluation this script allows, and only in
+// TEST_MODE: capped with .limit(500) first, so it's cheap regardless of
+// how many rows the small test region would otherwise produce, and it
+// never runs against the full region. This is a deliberate exception to
+// the PERFORMANCE NOTE at the top of the file — everywhere else, no
+// .size()/.getInfo() on GEDI-derived collections. For the real regional
+// export, set TEST_MODE = false above; this block then does nothing (no
+// print, no evaluation) and can be left in place or deleted.
+if (TEST_MODE) {
+  print('TEST row count:', training.limit(500).size());
+}
 
 var exportColumns = ['agbd', 'agbd_se', 'shot_date', 'lat', 'lon',
     'sensitivity', 'landsat_treecover', 'pft_class',
