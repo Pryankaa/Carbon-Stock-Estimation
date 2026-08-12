@@ -37,6 +37,12 @@
  * per-band cap, so neither the near-zero majority nor the common
  * mid-high band can crowd out the rare dense-canopy shots (see CONFIG).
  *
+ * GEDI coverage note: this script reads GEDI04_A_002_MONTHLY (see CONFIG —
+ * the footprint-level GEDI04_A_002 asset is a table/index folder, not an
+ * ImageCollection, and errors in GEE). That monthly raster mosaic covers
+ * March 2019 - March 2023 only, so all training labels here are 2019-2023,
+ * not 2024.
+ *
  * Output: one CSV row per sampled quality GEDI shot, columns = agbd,
  * agbd_se, GEDI shot date, lat, lon, GEDI's own covariates (sensitivity,
  * landsat_treecover, pft_class — already in L4A, standing in for an
@@ -80,7 +86,11 @@ var REGION = ee.Geometry.Rectangle([72, 20, 76, 24]);
 // var CANOPY_HEIGHT_ASSET_ID =
 //   'projects/sat-io/open-datasets/ETH_GlobalCanopyHeight_2020_10m_v1';
 
-var GEDI_COLLECTION_ID = 'LARSE/GEDI/GEDI04_A_002';
+// GEDI04_A_002 (footprint-level) is a table/index folder in this GEE asset,
+// not an ImageCollection — loading it directly throws "found IndexedFolder".
+// Use the monthly raster mosaic instead; it's the same asset the 3.6M-shot
+// checkpoint used. Coverage is March 2019 - March 2023 only (see header).
+var GEDI_COLLECTION_ID = 'LARSE/GEDI/GEDI04_A_002_MONTHLY';
 var S2_COLLECTION_ID = 'COPERNICUS/S2_SR_HARMONIZED';
 
 // Cloud Score+ replaces QA60 for cloud masking (see section 2 below for
@@ -147,6 +157,15 @@ var gediRaw = ee.ImageCollection(GEDI_COLLECTION_ID)
 // GEDI covariates already present in L4A itself (sensitivity,
 // landsat_treecover, pft_class) stand in for an external height layer for
 // now — no separate L2A join needed.
+//
+// NOTE: GEDI_COLLECTION_ID is already a per-month mosaic (one image per
+// calendar month, not one per orbit granule), so where footprints from more
+// than one month land on the same ~25 m grid cell, the .mosaic() below picks
+// a single month's values for that pixel — shot_date_millis is therefore
+// approximate (month-level, not the exact original per-footprint date) in
+// those overlap cases. Acceptable for this first training run since
+// season-year matching only needs month-level dates anyway; flag for
+// refinement later if exact per-footprint dates turn out to matter.
 var gediMosaic = gediRaw
   .select(['agbd', 'agbd_se', 'lat_lowestmode', 'lon_lowestmode', 'shot_date_millis',
     'sensitivity', 'landsat_treecover', 'pft_class'])
@@ -258,7 +277,8 @@ for (var d = 0; d < DISTRIBUTION_BAND_EDGES.length - 1; d++) {
 
 // QA60-based masking was dropped: in Sentinel-2's newer processing baseline
 // (roughly post-2022), QA60 is often all-zero, so clouds pass straight
-// through unmasked. Since GEDI shots run to 2024, that would have silently
+// through unmasked. GEDI shots here run through March 2023 (see header),
+// squarely inside that newer-baseline window, so this would have silently
 // contaminated a large share of the training features with unmasked cloud
 // pixels. Cloud Score+ gives a per-pixel ML-based clear-sky probability
 // (cs_cdf) instead, joined to each S2 scene by system:index via
