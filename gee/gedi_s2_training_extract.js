@@ -22,6 +22,15 @@
  *      wherever Sentinel-2 exists, including hectare sites with zero GEDI
  *      coverage of their own.
  *
+ * NOTE: step 2 originally matched each shot to Sentinel-2 imagery from its
+ * own year (see CLAUDE.md's time-alignment rule). That per-year join broke
+ * silently (an ee.Number/plain-JS-number equality mismatch) and produced
+ * an export with correct headers but zero rows. This version replaces it
+ * with ONE multi-year composite (all of SEASON_YEARS pooled together, see
+ * section 2) sampled at every shot regardless of its date — trading away
+ * per-shot time-alignment for a working end-to-end export. Reintroduce
+ * per-year/per-shot matching once the rest of the pipeline is validated.
+ *
  * THIS SCRIPT ONLY BUILDS AND EXPORTS THE TRAINING TABLE.
  * No model, no prediction, no per-site inference happens here.
  *
@@ -46,10 +55,11 @@
  * Output: one CSV row per sampled quality GEDI shot, columns = agbd,
  * agbd_se, GEDI shot date, lat, lon, GEDI's own covariates (sensitivity,
  * landsat_treecover, pft_class — already in L4A, standing in for an
- * external height layer for now), Sentinel-2 post-monsoon/dry-season
- * NDVI + EVI, and post-monsoon/dry-season-matched reflectance bands B2-B12
- * (B10 excluded: it is an L1C-only cirrus band, not present in the L2A
- * surface-reflectance product).
+ * external height layer for now), and Sentinel-2 post-monsoon/dry-season
+ * NDVI + EVI plus reflectance bands B2-B12 (B10 excluded: it is an
+ * L1C-only cirrus band, not present in the L2A surface-reflectance
+ * product) — all from ONE multi-year composite, the same for every shot
+ * regardless of its date (see NOTE above and section 2).
  *
  * External canopy-height sampling is DISABLED for this first run — see the
  * TODO in the CONFIG section below.
@@ -104,11 +114,11 @@ var REGION = ee.Geometry.Rectangle([72, 20, 76, 24]);
 var GEDI_COLLECTION_ID = 'LARSE/GEDI/GEDI04_A_002_MONTHLY';
 var S2_COLLECTION_ID = 'COPERNICUS/S2_SR_HARMONIZED';
 
-// Hardcoded to match GEDI04_A_002_MONTHLY's actual coverage (March 2019 -
-// March 2023) instead of computing it from the shot collection's min/max
-// date — that would require a .getInfo() round trip over the full ~3.6M
-// shot collection just to find the range, which is itself slow enough to
-// hang the Code Editor.
+// Years folded into the single multi-year post-monsoon/dry-season
+// composite below (section 2) — hardcoded to match GEDI04_A_002_MONTHLY's
+// actual coverage (March 2019 - March 2023) instead of computing it from
+// the shot collection's min/max date, which would require a .getInfo()
+// round trip over the full ~3.6M shot collection just to find the range.
 var SEASON_YEARS = [2019, 2020, 2021, 2022, 2023];
 
 // Cloud Score+ replaces QA60 for cloud masking (see section 2 below for
@@ -192,9 +202,11 @@ var gediRaw = ee.ImageCollection(GEDI_COLLECTION_ID)
 // than one month land on the same ~25 m grid cell, the .mosaic() below picks
 // a single month's values for that pixel — shot_date_millis is therefore
 // approximate (month-level, not the exact original per-footprint date) in
-// those overlap cases. Acceptable for this first training run since
-// season-year matching only needs month-level dates anyway; flag for
-// refinement later if exact per-footprint dates turn out to matter.
+// those overlap cases. Acceptable for this first training run — shot_date
+// is carried through as an export column for reference only now (see
+// section 2: Sentinel-2 features are no longer per-shot time-matched);
+// flag for refinement later if exact per-footprint dates turn out to
+// matter.
 var gediMosaic = gediRaw
   .select(['agbd', 'agbd_se', 'lat_lowestmode', 'lon_lowestmode', 'shot_date_millis',
     'sensitivity', 'landsat_treecover', 'pft_class'])
@@ -210,30 +222,22 @@ var gediShots = gediMosaic.sample({
   tileScale: 16
 });
 
-// Tag each shot with the "season year" its matched Sentinel-2 window will
-// use: shots from Jul-Dec belong to that calendar year's post-monsoon/dry
-// pair; shots from Jan-Jun belong to the PREVIOUS year's pair (whose dry
-// season runs into Jan-Mar of the shot's own year). Either way the matched
-// window stays within about 6 months of the shot, per spec.
+// Carry shot_date/lat/lon through as human-readable export columns. No
+// per-shot season_year tag anymore — see section 2 for why.
 gediShots = gediShots.map(function(f) {
   var d = ee.Date(f.get('shot_date_millis'));
-  var month = d.get('month');
-  var year = d.get('year');
-  var seasonYear = ee.Algorithms.If(month.gte(7), year, year.subtract(1));
   return f.set({
     shot_date: d.format('YYYY-MM-dd'),
     lat: f.get('lat_lowestmode'),
-    lon: f.get('lon_lowestmode'),
-    season_year: seasonYear
+    lon: f.get('lon_lowestmode')
   });
 });
 
 // No shot-count/date-range checkpoint here anymore: .size() and any
 // reduce() over gediShots (~3.6M features) forces a full server
 // computation for the Console and is what was hanging the Code Editor.
-// SEASON_YEARS above is hardcoded from the known asset coverage instead of
-// derived from the data. Check shot counts and date coverage from the
-// exported CSV instead (see PERFORMANCE NOTE at the top of this file).
+// Check shot counts and date coverage from the exported CSV instead (see
+// PERFORMANCE NOTE at the top of this file).
 
 // -----------------------------------------------------------------------
 // Stratified sampling — fixes the region's biomass imbalance (see header
@@ -284,8 +288,22 @@ gediShots = highBiomassShots.merge(lowBiomassShots);
 // only actually gets computed once, inside the export task.
 
 // =============================================================================
-// 2. Sentinel-2: cloud masking, indices, and time-matched seasonal composites
+// 2. Sentinel-2: cloud masking, indices, and ONE multi-year composite
 // =============================================================================
+
+// PER-YEAR TIME-ALIGNMENT REMOVED. The previous version matched each shot
+// to its own year's composite via ee.Filter.eq('season_year', y), but
+// season_year was a server-side ee.Number on the shots and a plain JS
+// integer on the composites — the equality never matched, every year's
+// join came back empty, and the export produced zero rows with correct
+// headers. Rather than debug that join further, this version drops
+// per-shot time-matching entirely: ALL quality shots are sampled against
+// a single composite built from Oct-Dec and Jan-Mar imagery pooled across
+// every year in SEASON_YEARS (2019-2023), regardless of each shot's own
+// date. This trades away the time-alignment CLAUDE.md originally asked
+// for in favor of a working end-to-end export; reintroduce per-year (or
+// per-shot) matching later once the rest of the pipeline — sampling,
+// training, validation — is proven out on real data.
 
 // QA60-based masking was dropped: in Sentinel-2's newer processing baseline
 // (roughly post-2022), QA60 is often all-zero, so clouds pass straight
@@ -316,16 +334,32 @@ function addIndices(image) {
   return image.addBands([ndvi, evi]);
 }
 
-// No scene-count print here: an empty seasonal window (zero S2 scenes)
-// used to be caught by printing s2WithCs.size() per season, but that's a
-// live server computation per call — with SEASON_YEARS x 2 seasons that's
-// 10 of them, which is exactly the kind of interactive cost this rewrite
-// removes. If a season silently has zero scenes, its shots will be absent
-// from that year in the exported CSV — check season/year coverage there.
-function seasonalMedian(region, start, end) {
+// Builds a single ee.Filter that's the OR of one date range per year in
+// `years`, e.g. for Oct 1 - Dec 31 across 2019-2023 that's five ranges
+// OR'd together — matching any scene that falls in that month-window in
+// ANY of those years, not just one.
+function multiYearDateFilter(years, startMonth, startDay, endMonth, endDay) {
+  var yearFilters = years.map(function(y) {
+    return ee.Filter.date(
+      ee.Date.fromYMD(y, startMonth, startDay),
+      ee.Date.fromYMD(y, endMonth, endDay).advance(1, 'day') // filterDate's end is exclusive
+    );
+  });
+  return ee.Filter.or.apply(null, yearFilters);
+}
+
+var POST_MONSOON_FILTER = multiYearDateFilter(SEASON_YEARS, 10, 1, 12, 31);
+var DRY_SEASON_FILTER = multiYearDateFilter(SEASON_YEARS, 1, 1, 3, 31);
+
+// No scene-count print here: a live .size() on the filtered S2 collection
+// is exactly the kind of interactive cost this script avoids everywhere
+// else (see PERFORMANCE NOTE at the top). If either season effectively has
+// no clear scenes across all five years pooled together, that would show
+// up as near-empty NDVI/EVI/reflectance columns in the exported CSV.
+function seasonalMedian(region, dateFilter) {
   var s2 = ee.ImageCollection(S2_COLLECTION_ID)
     .filterBounds(region)
-    .filterDate(start, end);
+    .filter(dateFilter);
   var csPlus = ee.ImageCollection(CS_PLUS_COLLECTION_ID);
   var s2WithCs = s2.linkCollection(csPlus, [CS_PLUS_BAND]);
 
@@ -335,55 +369,32 @@ function seasonalMedian(region, start, end) {
 // var canopyHeight = ee.Image(CANOPY_HEIGHT_ASSET_ID).select(0).rename('canopy_height');
 // ^ disabled — see TODO in the CONFIG section above.
 
-// One post-monsoon (Oct-Dec) + dry-season (Jan-Mar of the following year)
-// composite pair per calendar year present in the GEDI data, rather than one
-// composite per individual shot — far cheaper, and every shot still lands
-// within ~6 months of its matched window (see season_year tagging above).
-// y is a plain JS number from SEASON_YEARS below, not an ee.Number.
-function seasonalComposites(y) {
-  var postMonsoonStart = ee.Date.fromYMD(y, 10, 1);
-  var postMonsoonEnd = ee.Date.fromYMD(y, 12, 31);
-  var dryStart = ee.Date.fromYMD(y + 1, 1, 1);
-  var dryEnd = ee.Date.fromYMD(y + 1, 3, 31);
+var postMonsoon = addIndices(seasonalMedian(REGION, POST_MONSOON_FILTER));
+var dry = addIndices(seasonalMedian(REGION, DRY_SEASON_FILTER));
 
-  var postMonsoon = addIndices(seasonalMedian(REGION, postMonsoonStart, postMonsoonEnd));
-  var dry = addIndices(seasonalMedian(REGION, dryStart, dryEnd));
+var postMonsoonIndices = postMonsoon.select(['NDVI', 'EVI'], ['ndvi_postmonsoon', 'evi_postmonsoon']);
+var dryIndices = dry.select(['NDVI', 'EVI'], ['ndvi_dryseason', 'evi_dryseason']);
+// Reflectance bands are taken from the dry-season composite only (clearer
+// atmosphere, fewer monsoon-residual clouds) to avoid exporting the same
+// eleven bands twice under two names.
+var dryReflectance = dry.select(S2_BANDS);
 
-  var postMonsoonIndices = postMonsoon.select(['NDVI', 'EVI'], ['ndvi_postmonsoon', 'evi_postmonsoon']);
-  var dryIndices = dry.select(['NDVI', 'EVI'], ['ndvi_dryseason', 'evi_dryseason']);
-  // Reflectance bands are taken from the dry-season composite only (clearer
-  // atmosphere, fewer monsoon-residual clouds) to avoid exporting the same
-  // eleven bands twice under two names.
-  var dryReflectance = dry.select(S2_BANDS);
-
-  return postMonsoonIndices
-    .addBands(dryIndices)
-    .addBands(dryReflectance)
-    // .addBands(canopyHeight) // disabled — see TODO in the CONFIG section above.
-    .set('season_year', y);
-}
-
-// SEASON_YEARS (CONFIG, top of file) is hardcoded from GEDI04_A_002_MONTHLY's
-// known coverage — no min/max reduce over gediShots and no .getInfo() round
-// trip needed to find the range.
-var yearlyComposites = ee.ImageCollection(SEASON_YEARS.map(seasonalComposites));
+// canopyHeight would be .addBands() here too if re-enabled — see TODO in
+// the CONFIG section above.
+var seasonalComposite = postMonsoonIndices
+  .addBands(dryIndices)
+  .addBands(dryReflectance);
 
 // =============================================================================
-// 3. Sample Sentinel-2 at each GEDI shot, matched by year
+// 3. Sample the single multi-year composite at every stratified GEDI shot
 // =============================================================================
 
-var trainingByYear = SEASON_YEARS.map(function(y) {
-  var shotsThisYear = gediShots.filter(ee.Filter.eq('season_year', y));
-  var composite = ee.Image(yearlyComposites.filter(ee.Filter.eq('season_year', y)).first());
-  return composite.sampleRegions({
-    collection: shotsThisYear,
-    scale: 10,
-    geometries: true,
-    tileScale: 16
-  });
+var training = seasonalComposite.sampleRegions({
+  collection: gediShots,
+  scale: 10,
+  geometries: true,
+  tileScale: 16
 });
-
-var training = ee.FeatureCollection(trainingByYear).flatten();
 
 // =============================================================================
 // 4. Export training CSV to Drive
