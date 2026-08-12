@@ -90,9 +90,10 @@
 // Everything below stays lazy; the heavy work only actually runs once,
 // inside the Export.table.toDrive task. To inspect the biomass
 // distribution and shot counts, do it AFTER exporting — load the CSV in
-// Python (Claude Code can do this) rather than adding print()s here. The
-// one exception is the capped TEST_MODE row-count check right before the
-// export (section 4) — see TEST_MODE above.
+// Python (Claude Code can do this) rather than adding print()s here. No
+// interactive row-count check either, even in TEST_MODE — that's still
+// heavy enough to hit the Code Editor's timeout; TEST_MODE verifies via a
+// real (small-region) export instead. See TEST_MODE above and section 4.
 // -----------------------------------------------------------------------
 
 // =============================================================================
@@ -102,13 +103,19 @@
 // TEST_MODE: fail-fast check on a small, known-vegetated area before
 // burning a long run on the full region. When true, REGION below is
 // overridden with a 0.3 deg box in the Western Ghats (real forest, plenty
-// of GEDI shots expected) and the ONE interactive print near the export
-// at the bottom is enabled.
+// of GEDI shots expected), and EXPORT_FILE_PREFIX (below) gets a TEST
+// suffix so the small-box export can't be confused with the real one.
 //
-// Workflow: run with TEST_MODE = true, confirm "TEST row count" in the
-// Console is > 0, THEN set TEST_MODE = false and start the real export
-// task. Leave TEST_MODE = false for the real regional export — the test
-// print is gated on it and won't fire (or hang the UI) once it's off.
+// The verification step is the EXPORT itself, not an interactive print —
+// an interactive check heavy enough to matter (e.g.
+// training.limit(500).size()) still has to build the full lazy chain live
+// in the browser and hits the Code Editor's ~5 minute timeout regardless
+// of any .limit(). Export.table.toDrive runs the same computation
+// server-side as a batch task with far more headroom, so on the small
+// TEST_MODE region it actually finishes (a minute or two) and is a real
+// test of the real export path. Workflow: run the export with
+// TEST_MODE = true, check the resulting CSV has rows, THEN set
+// TEST_MODE = false and run the real regional export.
 var TEST_MODE = true;
 
 // Placeholder region: Gujarat/Maharashtra, ~20-24 N, 72-76 E.
@@ -199,13 +206,18 @@ var RANDOM_SEED = 42; // fixed seed so the subsamples are reproducible across ru
 var S2_BANDS = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12'];
 
 var EXPORT_FOLDER = 'carbon_stock_estimation';
-var EXPORT_FILE_PREFIX = 'gedi_l4a_s2_training_gujarat_maharashtra';
+// Distinct filename in TEST_MODE so a small-box test export can never be
+// mistaken for (or accidentally overwrite) the real regional one.
+var EXPORT_FILE_PREFIX = TEST_MODE
+  ? 'gedi_l4a_s2_training_TEST_western_ghats'
+  : 'gedi_l4a_s2_training_gujarat_maharashtra';
 
 // These two are also cheap: REGION is a small client-side geometry, and
 // the rest are plain JS config values — neither touches the GEDI shot
 // collection or triggers any server computation. (The GEDI band-names
-// print above is the third; the TEST_MODE row-count print near the export
-// is the fourth and only conditional one — see PERFORMANCE NOTE.)
+// print above is the third and last print in this script — see
+// PERFORMANCE NOTE and section 4 for why there's no interactive test
+// print anymore.)
 print('Region:', REGION);
 print('Config — biomass threshold (Mg/ha):', BIOMASS_THRESHOLD_MG_HA,
   '| low-tier sample size:', LOW_BIOMASS_SAMPLE_SIZE,
@@ -217,11 +229,21 @@ print('Config — biomass threshold (Mg/ha):', BIOMASS_THRESHOLD_MG_HA,
 // 1. GEDI L4A footprint-level shots, quality-filtered
 // =============================================================================
 
-// Keep only quality shots (spec: l4_quality_flag == 1, degrade_flag == 0).
-// No date band anymore — lat_lowestmode/lon_lowestmode/shot_date_millis
-// were all invalid on this gridded MONTHLY raster (see the band-names
-// print above and the CONFIG comment), and shot_date isn't needed for
-// anything now that per-shot time-matching is gone (see section 2).
+// This asset has ~170 bands total. Select down to only what's actually
+// needed — labels + the two quality flags (used transiently to build the
+// mask, then dropped) — as the very FIRST operation, before quality
+// masking and before mosaicking. Every downstream step (updateMask,
+// mosaic, sample) then only ever touches this narrow set instead of all
+// ~170 bands on every source image; this is what was making the
+// interactive test time out. sensitivity/landsat_treecover/pft_class are
+// commented out until verified against the 'GEDI monthly bands' print
+// above — re-enable here AND in the final .select() below AND in
+// exportColumns (section 4) once confirmed present.
+var GEDI_BANDS_NEEDED = [
+  'agbd', 'agbd_se', 'l4_quality_flag', 'degrade_flag'
+  // , 'sensitivity', 'landsat_treecover', 'pft_class'
+];
+
 function qualityMask(image) {
   var quality = image.select('l4_quality_flag').eq(1)
     .and(image.select('degrade_flag').eq(0));
@@ -230,11 +252,11 @@ function qualityMask(image) {
 
 var gediRaw = ee.ImageCollection(GEDI_COLLECTION_ID)
   .filterBounds(REGION)
+  .select(GEDI_BANDS_NEEDED)
   .map(qualityMask);
 
-// sensitivity/landsat_treecover/pft_class are commented out until
-// verified against the 'GEDI monthly bands' print above — re-enable
-// (and add back to exportColumns in section 4) once confirmed present.
+// Quality flags have done their job (masking) — drop them here so only
+// the actual training-data bands reach mosaic/sample.
 var gediMosaic = gediRaw
   .select([
     'agbd', 'agbd_se'
@@ -430,17 +452,18 @@ var training = seasonalComposite.sampleRegions({
 // 4. Export training CSV to Drive
 // =============================================================================
 
-// The ONE interactive evaluation this script allows, and only in
-// TEST_MODE: capped with .limit(500) first, so it's cheap regardless of
-// how many rows the small test region would otherwise produce, and it
-// never runs against the full region. This is a deliberate exception to
-// the PERFORMANCE NOTE at the top of the file — everywhere else, no
-// .size()/.getInfo() on GEDI-derived collections. For the real regional
-// export, set TEST_MODE = false above; this block then does nothing (no
-// print, no evaluation) and can be left in place or deleted.
-if (TEST_MODE) {
-  print('TEST row count:', training.limit(500).size());
-}
+// No interactive row-count check here anymore. training.limit(500).size()
+// still has to build and evaluate the full lazy chain (stratified
+// sampling -> multi-year composite -> sampleRegions) live in the browser,
+// which is heavy enough to hit the Code Editor's ~5 minute interactive
+// timeout regardless of the .limit(500) cap — the timeout does NOT mean
+// the export itself would fail; Export.table.toDrive runs the identical
+// computation server-side as a batch task with far more headroom. The
+// actual test is TEST_MODE itself (see CONFIG): with it on, REGION is
+// the small Western Ghats box, so this same export finishes in a minute
+// or two and is a real test of the real export path. Workflow: run the
+// export with TEST_MODE = true, check the resulting CSV has rows, then
+// set TEST_MODE = false and run the real regional export.
 
 // sensitivity/landsat_treecover/pft_class dropped from selectors along with
 // the .select() in section 1 above — add back together once verified.
