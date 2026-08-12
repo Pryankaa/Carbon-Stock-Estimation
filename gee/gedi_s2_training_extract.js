@@ -36,15 +36,17 @@
  *
  * The region (Gujarat + Maharashtra) turns out to be heavily biomass-
  * imbalanced: median shot biomass ~4 Mg/ha, 90th percentile ~39 Mg/ha, since
- * most of the region is dryland/cropland/urban rather than forest. A naive
- * random sample of the ~3.6M quality shots would be almost entirely
- * near-zero biomass and would starve a model of the high-biomass (tree)
- * signal it needs. So this script applies STRATIFIED sampling on both
- * ends: the low-biomass majority is randomly subsampled down to a
- * manageable size, AND the high-biomass tier is split into bands (most
- * high shots cluster at 20-40 Mg/ha, very few above 120) with its own
- * per-band cap, so neither the near-zero majority nor the common
- * mid-high band can crowd out the rare dense-canopy shots (see CONFIG).
+ * most of the region is dryland/cropland/urban rather than forest. Earlier
+ * versions of this script applied STRATIFIED sampling here, in GEE, before
+ * export. That's gone: a single .sample() over the whole ~3.6M-shot region
+ * exceeds GEE's per-operation size limit ("Image.sample: Computed value is
+ * too large") regardless of any downstream capping, so this script now
+ * tiles the region (see section 3) and exports EVERY quality-filtered shot
+ * per tile, unfiltered by biomass. Stratified sampling now happens ONCE in
+ * the Python pipeline, after combining the tile CSVs (see CLAUDE.md) —
+ * stratifying per tile here would over-sample each tile's low-biomass
+ * majority and under-represent rare high-biomass shots relative to the
+ * combined dataset.
  *
  * GEDI coverage note: this script reads GEDI04_A_002_MONTHLY (see CONFIG —
  * the footprint-level GEDI04_A_002 asset is a table/index folder, not an
@@ -52,18 +54,23 @@
  * March 2019 - March 2023 only, so all training labels here are 2019-2023,
  * not 2024.
  *
- * Output: one CSV row per sampled quality GEDI shot, columns = agbd,
- * agbd_se, lat, lon (derived from each sampled feature's own geometry —
- * lat_lowestmode/lon_lowestmode are footprint-TABLE columns, not bands on
- * this gridded MONTHLY raster, and selecting them made .sample() return
- * empty; see CONFIG and section 1), and Sentinel-2 post-monsoon/dry-season
- * NDVI + EVI plus reflectance bands B2-B12 (B10 excluded: it is an
- * L1C-only cirrus band, not present in the L2A surface-reflectance
- * product) — all from ONE multi-year composite, the same for every shot
- * regardless of its date (see NOTE above and section 2). No shot_date
- * column (dropped along with per-shot time-matching) and no
- * sensitivity/landsat_treecover/pft_class for now — commented out in
- * section 1 pending verification against the 'GEDI monthly bands' print.
+ * Output: for the real regional run, one CSV per tile (16 export tasks,
+ * same Drive folder, filenames suffixed _tile_i_j — see section 3); for
+ * TEST_MODE, one CSV over the small test box. Every CSV has the same
+ * columns: one row per quality GEDI shot in that tile/region (ALL of
+ * them — no biomass filtering or capping, see the imbalance note above),
+ * agbd, agbd_se, lat, lon (derived from each sampled feature's own
+ * geometry — lat_lowestmode/lon_lowestmode are footprint-TABLE columns,
+ * not bands on this gridded MONTHLY raster, and selecting them made
+ * .sample() return empty; see CONFIG and section 1), and Sentinel-2
+ * post-monsoon/dry-season NDVI + EVI plus reflectance bands B2-B12 (B10
+ * excluded: it is an L1C-only cirrus band, not present in the L2A
+ * surface-reflectance product) — all from ONE multi-year composite,
+ * shared across every tile and every shot regardless of its date (see
+ * NOTE above and section 2). No shot_date column (dropped along with
+ * per-shot time-matching) and no sensitivity/landsat_treecover/pft_class
+ * for now — commented out in section 1 pending verification against the
+ * 'GEDI monthly bands' print.
  *
  * External canopy-height sampling is DISABLED for this first run — see the
  * TODO in the CONFIG section below.
@@ -75,7 +82,7 @@
  *     sensitivity/landsat_treecover/pft_class covariates were meant to
  *     stand in instead, but are temporarily commented out in section 1
  *     pending verification against the 'GEDI monthly bands' print — no
- *     height/vegetation signal is included in this test-mode run.
+ *     height/vegetation signal is included in exports until re-enabled.
  *   - Rule 6: does NOT add Sentinel-1 SAR or optical GLCM texture back in.
  *   - GEDI is explicitly treated as regional training data here, never as a
  *     per-site estimator (see header above and the immediate-next-task note
@@ -87,13 +94,16 @@
 // full region has ~3.6M quality GEDI shots — evaluating that collection
 // for a live print (a .size(), a full reduce, a per-band or distribution
 // scan) is enough on its own to make the Code Editor unresponsive.
-// Everything below stays lazy; the heavy work only actually runs once,
-// inside the Export.table.toDrive task. To inspect the biomass
-// distribution and shot counts, do it AFTER exporting — load the CSV in
-// Python (Claude Code can do this) rather than adding print()s here. No
-// interactive row-count check either, even in TEST_MODE — that's still
-// heavy enough to hit the Code Editor's timeout; TEST_MODE verifies via a
-// real (small-region) export instead. See TEST_MODE above and section 4.
+// Everything below stays lazy; the heavy work only actually runs once per
+// tile, inside each Export.table.toDrive task (see section 3 — tiling is
+// also what fixes "Image.sample: Computed value is too large" on the full
+// region). To inspect the biomass distribution and shot counts, do it
+// AFTER exporting and combining the tile CSVs — in Python (Claude Code
+// can do this), where stratified sampling now lives too (see CLAUDE.md),
+// rather than adding print()s or per-tile capping here. No interactive
+// row-count check either, even in TEST_MODE — that's still heavy enough
+// to hit the Code Editor's timeout; TEST_MODE verifies via a real
+// (small-region) export instead. See TEST_MODE above and section 3.
 // -----------------------------------------------------------------------
 
 // =============================================================================
@@ -118,9 +128,17 @@
 // TEST_MODE = false and run the real regional export.
 var TEST_MODE = false;
 
-// Placeholder region: Gujarat/Maharashtra, ~20-24 N, 72-76 E.
-// Replace with the real regional bounding box before running.
-var REGION = ee.Geometry.Rectangle([72, 20, 76, 24]);
+// Placeholder region: Gujarat/Maharashtra, ~20-24 N, 72-76 E. Replace with
+// the real regional bounding box before running. Kept as plain JS numbers
+// (not just baked into REGION below) so the tiling grid in section 3 can
+// reuse the exact same bounds — one source of truth, so the two can never
+// drift apart the way BIOMASS_THRESHOLD_MG_HA and the sampling bands
+// nearly did earlier in this script's history.
+var FULL_REGION_BOUNDS = { west: 72, south: 20, east: 76, north: 24 };
+var REGION = ee.Geometry.Rectangle([
+  FULL_REGION_BOUNDS.west, FULL_REGION_BOUNDS.south,
+  FULL_REGION_BOUNDS.east, FULL_REGION_BOUNDS.north
+]);
 
 if (TEST_MODE) {
   // Small box in the Western Ghats — real forest, should return a
@@ -128,6 +146,12 @@ if (TEST_MODE) {
   // region.
   REGION = ee.Geometry.Rectangle([73.0, 20.0, 73.3, 20.3]);
 }
+
+// Stratified sampling has moved to the Python pipeline (see CLAUDE.md) —
+// this script exports every quality-filtered shot, tiled to stay under
+// GEE's per-operation size limit. Only used when !TEST_MODE (see
+// section 3); the small TEST_MODE box is exported as a single task.
+var TILE_GRID_SIZE = 4; // 4x4 = 16 tiles, 1 deg x 1 deg each, covering FULL_REGION_BOUNDS
 
 // TODO(height strategy): external canopy-height sampling is disabled. The
 // candidate asset ID below is unverified (unconfirmed in this environment),
@@ -137,7 +161,7 @@ if (TEST_MODE) {
 // pft_class covariates were meant to stand in instead (contemporaneous with
 // each shot), but are currently commented out of the .select() in section 1
 // pending verification against the 'GEDI monthly bands' print below — so
-// this test-mode run carries no height/vegetation signal at all yet.
+// exports carry no height/vegetation signal at all yet.
 // Revisit once we know whether these covariates carry enough signal on
 // their own, or whether a genuinely current external height product is
 // needed.
@@ -175,31 +199,6 @@ var CS_PLUS_COLLECTION_ID = 'GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED';
 var CS_PLUS_BAND = 'cs_cdf';
 var CS_PLUS_CLEAR_THRESHOLD = 0.6;
 
-// Stratified sampling to fix the region's biomass imbalance (median ~4
-// Mg/ha, 90th percentile ~39 Mg/ha — see header). Shots below
-// BIOMASS_THRESHOLD_MG_HA are randomly subsampled down to
-// LOW_BIOMASS_SAMPLE_SIZE; shots at or above it are split into bands and
-// each band is capped at its own target, so the training set is balanced
-// in both directions instead of swamped by near-zero OR dominated by the
-// most common high-biomass band.
-var BIOMASS_THRESHOLD_MG_HA = 20; // high/low split; ~90th percentile is 39 Mg/ha, so this keeps essentially all real tree signal
-var LOW_BIOMASS_SAMPLE_SIZE = 30000; // target row count for the random low-biomass subsample
-var HIGH_BIOMASS_SAMPLE_SIZE = 30000; // total target across all high-biomass bands combined, matching the low tier
-
-// Most high-biomass shots cluster at 20-40 Mg/ha with very few above 120;
-// a flat cap on the whole high tier would be dominated by 20-40 Mg/ha
-// shots and lose the dense-canopy upper range. Splitting into bands and
-// giving each an equal share of HIGH_BIOMASS_SAMPLE_SIZE keeps the rare,
-// most valuable dense-canopy shots from being crowded out — a band with
-// fewer real shots than its target just keeps everything it has.
-// First edge is tied to BIOMASS_THRESHOLD_MG_HA (not re-hardcoded) so the
-// low tier and the high tier's first band can never drift apart into an
-// overlap or a gap.
-var HIGH_BIOMASS_BAND_EDGES = [BIOMASS_THRESHOLD_MG_HA, 40, 70, 120, Infinity]; // Mg/ha; edit to change bands
-var HIGH_BAND_TARGET = Math.floor(HIGH_BIOMASS_SAMPLE_SIZE / (HIGH_BIOMASS_BAND_EDGES.length - 1));
-
-var RANDOM_SEED = 42; // fixed seed so the subsamples are reproducible across runs
-
 // Surface-reflectance bands to export. B10 is intentionally excluded: it is
 // an L1C-only cirrus-detection band and does not exist in the L2A (SR)
 // product this script uses.
@@ -216,14 +215,12 @@ var EXPORT_FILE_PREFIX = TEST_MODE
 // the rest are plain JS config values — neither touches the GEDI shot
 // collection or triggers any server computation. (The GEDI band-names
 // print above is the third and last print in this script — see
-// PERFORMANCE NOTE and section 4 for why there's no interactive test
+// PERFORMANCE NOTE and section 3 for why there's no interactive test
 // print anymore.)
 print('Region:', REGION);
-print('Config — biomass threshold (Mg/ha):', BIOMASS_THRESHOLD_MG_HA,
-  '| low-tier sample size:', LOW_BIOMASS_SAMPLE_SIZE,
-  '| high-tier sample size:', HIGH_BIOMASS_SAMPLE_SIZE,
-  '| high-tier bands (Mg/ha):', HIGH_BIOMASS_BAND_EDGES,
-  '| season years:', SEASON_YEARS);
+print('Config — TEST_MODE:', TEST_MODE,
+  '| season years:', SEASON_YEARS,
+  '| tile grid:', TEST_MODE ? 'n/a (single small-box export)' : (TILE_GRID_SIZE + 'x' + TILE_GRID_SIZE));
 
 // =============================================================================
 // 1. GEDI L4A footprint-level shots, quality-filtered
@@ -238,7 +235,7 @@ print('Config — biomass threshold (Mg/ha):', BIOMASS_THRESHOLD_MG_HA,
 // interactive test time out. sensitivity/landsat_treecover/pft_class are
 // commented out until verified against the 'GEDI monthly bands' print
 // above — re-enable here AND in the final .select() below AND in
-// exportColumns (section 4) once confirmed present.
+// exportColumns (section 3) once confirmed present.
 var GEDI_BANDS_NEEDED = [
   'agbd', 'agbd_se', 'l4_quality_flag', 'degrade_flag'
   // , 'sensitivity', 'landsat_treecover', 'pft_class'
@@ -267,77 +264,32 @@ var gediMosaic = gediRaw
 // GEDI footprints are rasterized at ~25 m in this asset with all in-between
 // pixels masked out, so sampling on the native grid and dropping masked
 // pixels recovers exactly the quality shot list (one feature per footprint).
-var gediShots = gediMosaic.sample({
-  region: REGION,
-  scale: 25,
-  geometries: true,
-  tileScale: 16
-});
-
-// lat/lon come from each sampled feature's own geometry (populated because
-// geometries: true above), not from nonexistent lat_lowestmode/
-// lon_lowestmode bands.
-gediShots = gediShots.map(function(f) {
-  var c = f.geometry().coordinates();
-  return f.set({
-    lon: c.get(0),
-    lat: c.get(1)
-  });
-});
-
-// No shot-count/date-range checkpoint here anymore: .size() and any
-// reduce() over gediShots (~3.6M features) forces a full server
-// computation for the Console and is what was hanging the Code Editor.
-// Check shot counts and date coverage from the exported CSV instead (see
-// PERFORMANCE NOTE at the top of this file).
-
-// -----------------------------------------------------------------------
-// Stratified sampling — fixes the region's biomass imbalance (see header
-// and CONFIG): subsample the low-biomass majority, and cap each
-// high-biomass band separately so dense-canopy shots aren't crowded out
-// by the far more common 20-40 Mg/ha band.
 //
-// lowOnlyShots (agbd < BIOMASS_THRESHOLD_MG_HA) and highOnlyShots
-// (agbd >= BIOMASS_THRESHOLD_MG_HA) partition the quality-filtered shots
-// exactly, with no gap and no overlap at the threshold. The low subsample
-// and every high band are filtered from these two disjoint collections
-// (never from the unsplit gediShots), so no single shot can ever be drawn
-// into both tiers.
-// -----------------------------------------------------------------------
-var lowOnlyShots = gediShots.filter(ee.Filter.lt('agbd', BIOMASS_THRESHOLD_MG_HA));
-var highOnlyShots = gediShots.filter(ee.Filter.gte('agbd', BIOMASS_THRESHOLD_MG_HA));
-
-var lowBiomassShots = lowOnlyShots
-  .randomColumn('random', RANDOM_SEED)
-  .sort('random')
-  .limit(LOW_BIOMASS_SAMPLE_SIZE);
-
-var highBiomassBands = [];
-for (var i = 0; i < HIGH_BIOMASS_BAND_EDGES.length - 1; i++) {
-  var bandLo = HIGH_BIOMASS_BAND_EDGES[i];
-  var bandHi = HIGH_BIOMASS_BAND_EDGES[i + 1];
-  var bandFilter = isFinite(bandHi)
-    ? ee.Filter.and(ee.Filter.gte('agbd', bandLo), ee.Filter.lt('agbd', bandHi))
-    : ee.Filter.gte('agbd', bandLo);
-  var bandShots = highOnlyShots
-    .filter(bandFilter)
-    .randomColumn('random', RANDOM_SEED + i) // vary seed per band
-    .sort('random')
-    .limit(HIGH_BAND_TARGET);
-  // No per-band print here: .size() on these filtered collections still
-  // forces a server computation per band, which is exactly what was
-  // hanging the Code Editor. Inspect the sampled distribution from the
-  // exported CSV instead (see PERFORMANCE NOTE at the top of this file).
-  highBiomassBands.push(bandShots);
+// Samples within `geom` only (a tile, or REGION directly in TEST_MODE) —
+// NOT the whole region in one call. A single .sample() over the full
+// ~3.6M-shot region is exactly what failed with "Image.sample: Computed
+// value is too large"; tiling (section 3) keeps each call small enough.
+// lat/lon are derived from each feature's own geometry (populated via
+// geometries: true), not from nonexistent lat_lowestmode/lon_lowestmode
+// bands. No biomass filtering or capping here — every quality-filtered
+// shot in `geom` is returned as-is; stratified sampling now happens ONCE
+// in Python after combining the tile CSVs (see CLAUDE.md and the header
+// NOTE above) rather than per tile here.
+function sampleGediShots(geom) {
+  var shots = gediMosaic.sample({
+    region: geom,
+    scale: 25,
+    geometries: true,
+    tileScale: 16
+  });
+  return shots.map(function(f) {
+    var c = f.geometry().coordinates();
+    return f.set({
+      lon: c.get(0),
+      lat: c.get(1)
+    });
+  });
 }
-var highBiomassShots = ee.FeatureCollection(highBiomassBands).flatten();
-
-gediShots = highBiomassShots.merge(lowBiomassShots);
-
-// No count/distribution prints here either — same reason. The whole point
-// of this restructuring is that gediShots stays an unevaluated, lazy
-// FeatureCollection all the way through the Sentinel-2 matching below; it
-// only actually gets computed once, inside the export task.
 
 // =============================================================================
 // 2. Sentinel-2: cloud masking, indices, and ONE multi-year composite
@@ -438,32 +390,9 @@ var seasonalComposite = postMonsoonIndices
   .addBands(dryReflectance);
 
 // =============================================================================
-// 3. Sample the single multi-year composite at every stratified GEDI shot
+// 3. Sample the multi-year composite at GEDI shots, and export — tiled
+//    for the full region, a single task for TEST_MODE
 // =============================================================================
-
-var training = seasonalComposite.sampleRegions({
-  collection: gediShots,
-  scale: 10,
-  geometries: true,
-  tileScale: 16
-});
-
-// =============================================================================
-// 4. Export training CSV to Drive
-// =============================================================================
-
-// No interactive row-count check here anymore. training.limit(500).size()
-// still has to build and evaluate the full lazy chain (stratified
-// sampling -> multi-year composite -> sampleRegions) live in the browser,
-// which is heavy enough to hit the Code Editor's ~5 minute interactive
-// timeout regardless of the .limit(500) cap — the timeout does NOT mean
-// the export itself would fail; Export.table.toDrive runs the identical
-// computation server-side as a batch task with far more headroom. The
-// actual test is TEST_MODE itself (see CONFIG): with it on, REGION is
-// the small Western Ghats box, so this same export finishes in a minute
-// or two and is a real test of the real export path. Workflow: run the
-// export with TEST_MODE = true, check the resulting CSV has rows, then
-// set TEST_MODE = false and run the real regional export.
 
 // sensitivity/landsat_treecover/pft_class dropped from selectors along with
 // the .select() in section 1 above — add back together once verified.
@@ -472,11 +401,62 @@ var exportColumns = ['agbd', 'agbd_se', 'lat', 'lon',
     'ndvi_postmonsoon', 'evi_postmonsoon', 'ndvi_dryseason', 'evi_dryseason']
   .concat(S2_BANDS);
 
-Export.table.toDrive({
-  collection: training,
-  description: 'gedi_l4a_s2_training_data',
-  folder: EXPORT_FOLDER,
-  fileNamePrefix: EXPORT_FILE_PREFIX,
-  fileFormat: 'CSV',
-  selectors: exportColumns
-});
+// Samples every quality-filtered GEDI shot in `geom` against the one
+// shared seasonalComposite, and starts one Export.table.toDrive task.
+// No interactive row-count check anywhere in this pipeline — even
+// capped with .limit(), evaluating this live in the browser is heavy
+// enough to hit the Code Editor's ~5 minute timeout regardless (that's
+// what happened before tiling: a timeout, not an export failure).
+// Export.table.toDrive runs the identical computation server-side as a
+// batch task with far more headroom, so the export itself is the real
+// test — see TEST_MODE above.
+function exportTile(geom, filePrefix, description) {
+  var shots = sampleGediShots(geom);
+  var tileTraining = seasonalComposite.sampleRegions({
+    collection: shots,
+    scale: 10,
+    geometries: true,
+    tileScale: 16
+  });
+  Export.table.toDrive({
+    collection: tileTraining,
+    description: description,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: filePrefix,
+    fileFormat: 'CSV',
+    selectors: exportColumns
+  });
+}
+
+if (TEST_MODE) {
+  // Single export over the small Western Ghats test box — no tiling
+  // needed; already proven (21,850 rows) to finish well within GEE's
+  // per-task limits without it.
+  exportTile(REGION, EXPORT_FILE_PREFIX, 'gedi_l4a_s2_training_data_TEST');
+} else {
+  // TILING — the full-region export previously failed with "Image.sample:
+  // Computed value is too large": a single .sample() call over the whole
+  // ~3.6M-shot region exceeds GEE's per-operation size limit, regardless
+  // of any downstream stratification/capping. Splitting FULL_REGION_BOUNDS
+  // into a TILE_GRID_SIZE x TILE_GRID_SIZE grid (see CONFIG) keeps each
+  // .sample() call within limits. One export task per tile, all into
+  // EXPORT_FOLDER, filenames suffixed _tile_i_j. Combine the resulting
+  // CSVs and do stratified sampling in Python afterward (see CLAUDE.md) —
+  // stratifying per tile here would over-sample each tile's low-biomass
+  // majority and under-represent rare high-biomass shots relative to the
+  // combined dataset.
+  var tileWidth = (FULL_REGION_BOUNDS.east - FULL_REGION_BOUNDS.west) / TILE_GRID_SIZE;
+  var tileHeight = (FULL_REGION_BOUNDS.north - FULL_REGION_BOUNDS.south) / TILE_GRID_SIZE;
+
+  for (var i = 0; i < TILE_GRID_SIZE; i++) {
+    for (var j = 0; j < TILE_GRID_SIZE; j++) {
+      var tileWest = FULL_REGION_BOUNDS.west + i * tileWidth;
+      var tileEast = tileWest + tileWidth;
+      var tileSouth = FULL_REGION_BOUNDS.south + j * tileHeight;
+      var tileNorth = tileSouth + tileHeight;
+      var tileGeom = ee.Geometry.Rectangle([tileWest, tileSouth, tileEast, tileNorth]);
+      var tileSuffix = '_tile_' + i + '_' + j;
+      exportTile(tileGeom, EXPORT_FILE_PREFIX + tileSuffix, 'gedi_l4a_s2_training_data' + tileSuffix);
+    }
+  }
+}

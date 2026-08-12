@@ -63,6 +63,15 @@ suggestions.
    (IPCC 2006 defaults). These are defaults, not site-measured — their uncertainty is on
    top of the model uncertainty.
 
+8. **Stratified sampling of GEDI training shots lives in the Python pipeline, not the GEE
+   script.** A single `.sample()` over a full multi-degree region (~3.6M shots) exceeds
+   GEE's per-operation size limit ("Image.sample: Computed value is too large") regardless
+   of any downstream capping, so the GEE extractor tiles the region and exports every
+   quality-filtered shot per tile, unstratified. Capping per tile in GEE would over-sample
+   each tile's low-biomass majority and under-represent rare high-biomass shots relative to
+   the combined dataset — stratify once, in Python, after combining the tile CSVs. Do not
+   re-add biomass thresholding/capping to the GEE script.
+
 ## Immediate next task
 
 Validate GEDI L4A against the CEPT field census before trusting it anywhere else. If GEDI
