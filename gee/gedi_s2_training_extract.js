@@ -54,7 +54,7 @@
  * March 2019 - March 2023 only, so all training labels here are 2019-2023,
  * not 2024.
  *
- * Output: for the real regional run, one CSV per tile (16 export tasks,
+ * Output: for the real regional run, one CSV per tile (64 export tasks,
  * same Drive folder, filenames suffixed _tile_i_j — see section 3); for
  * TEST_MODE, one CSV over the small test box. Every CSV has the same
  * columns: one row per quality GEDI shot in that tile/region (ALL of
@@ -151,7 +151,14 @@ if (TEST_MODE) {
 // this script exports every quality-filtered shot, tiled to stay under
 // GEE's per-operation size limit. Only used when !TEST_MODE (see
 // section 3); the small TEST_MODE box is exported as a single task.
-var TILE_GRID_SIZE = 4; // 4x4 = 16 tiles, 1 deg x 1 deg each, covering FULL_REGION_BOUNDS
+//
+// 4x4 (1 deg x 1 deg) still failed on denser tiles: tile_0_0 finished in
+// ~2 min, but tile_0_1 hit "reduceRegions: Computed value is too large"
+// after 10 min — shot density, not just tile area, drives the per-tile
+// operation size. The 0.3 deg TEST_MODE box handled ~22k rows fine, so
+// 0.5 deg tiles should have headroom even in dense areas. Shrink further
+// (higher TILE_GRID_SIZE) if any tile still fails.
+var TILE_GRID_SIZE = 8; // 8x8 = 64 tiles, 0.5 deg x 0.5 deg each, covering FULL_REGION_BOUNDS
 
 // TODO(height strategy): external canopy-height sampling is disabled. The
 // candidate asset ID below is unverified (unconfirmed in this environment),
@@ -434,17 +441,22 @@ if (TEST_MODE) {
   // per-task limits without it.
   exportTile(REGION, EXPORT_FILE_PREFIX, 'gedi_l4a_s2_training_data_TEST');
 } else {
-  // TILING — the full-region export previously failed with "Image.sample:
-  // Computed value is too large": a single .sample() call over the whole
-  // ~3.6M-shot region exceeds GEE's per-operation size limit, regardless
-  // of any downstream stratification/capping. Splitting FULL_REGION_BOUNDS
-  // into a TILE_GRID_SIZE x TILE_GRID_SIZE grid (see CONFIG) keeps each
-  // .sample() call within limits. One export task per tile, all into
-  // EXPORT_FOLDER, filenames suffixed _tile_i_j. Combine the resulting
-  // CSVs and do stratified sampling in Python afterward (see CLAUDE.md) —
-  // stratifying per tile here would over-sample each tile's low-biomass
-  // majority and under-represent rare high-biomass shots relative to the
-  // combined dataset.
+  // TILING — the full-region export first failed with "Image.sample:
+  // Computed value is too large" (a single .sample() over the whole
+  // ~3.6M-shot region exceeds GEE's per-operation size limit regardless of
+  // any downstream stratification/capping); a first fix at 4x4 (1 deg
+  // tiles) then failed on denser tiles with "reduceRegions: Computed value
+  // is too large" — shot DENSITY within a tile, not just its area, drives
+  // the per-operation size, so uniform degree-sized tiles can still
+  // overflow in forest-dense areas. TILE_GRID_SIZE (see CONFIG) controls
+  // tile size; shrink it further if a tile still fails. Splitting
+  // FULL_REGION_BOUNDS into a TILE_GRID_SIZE x TILE_GRID_SIZE grid keeps
+  // each .sample()/.sampleRegions() call within limits. One export task
+  // per tile, all into EXPORT_FOLDER, filenames suffixed _tile_i_j.
+  // Combine the resulting CSVs and do stratified sampling in Python
+  // afterward (see CLAUDE.md) — stratifying per tile here would
+  // over-sample each tile's low-biomass majority and under-represent rare
+  // high-biomass shots relative to the combined dataset.
   var tileWidth = (FULL_REGION_BOUNDS.east - FULL_REGION_BOUNDS.west) / TILE_GRID_SIZE;
   var tileHeight = (FULL_REGION_BOUNDS.north - FULL_REGION_BOUNDS.south) / TILE_GRID_SIZE;
 
