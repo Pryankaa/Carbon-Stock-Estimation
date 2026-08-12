@@ -53,13 +53,17 @@
  * not 2024.
  *
  * Output: one CSV row per sampled quality GEDI shot, columns = agbd,
- * agbd_se, GEDI shot date, lat, lon, GEDI's own covariates (sensitivity,
- * landsat_treecover, pft_class — already in L4A, standing in for an
- * external height layer for now), and Sentinel-2 post-monsoon/dry-season
+ * agbd_se, lat, lon (derived from each sampled feature's own geometry —
+ * lat_lowestmode/lon_lowestmode are footprint-TABLE columns, not bands on
+ * this gridded MONTHLY raster, and selecting them made .sample() return
+ * empty; see CONFIG and section 1), and Sentinel-2 post-monsoon/dry-season
  * NDVI + EVI plus reflectance bands B2-B12 (B10 excluded: it is an
  * L1C-only cirrus band, not present in the L2A surface-reflectance
  * product) — all from ONE multi-year composite, the same for every shot
- * regardless of its date (see NOTE above and section 2).
+ * regardless of its date (see NOTE above and section 2). No shot_date
+ * column (dropped along with per-shot time-matching) and no
+ * sensitivity/landsat_treecover/pft_class for now — commented out in
+ * section 1 pending verification against the 'GEDI monthly bands' print.
  *
  * External canopy-height sampling is DISABLED for this first run — see the
  * TODO in the CONFIG section below.
@@ -67,9 +71,11 @@
  * CLAUDE.md rules this script follows:
  *   - Rule 3: does NOT use the Meta/WRI ~2016 canopy height model (blind to
  *     anything planted after 2016). The external ~2020 replacement is
- *     disabled too for the same reason (see TODO below); GEDI's own
- *     sensitivity/landsat_treecover/pft_class covariates are used as the
- *     current height/vegetation signal instead.
+ *     disabled too for the same reason (see TODO below). GEDI's own
+ *     sensitivity/landsat_treecover/pft_class covariates were meant to
+ *     stand in instead, but are temporarily commented out in section 1
+ *     pending verification against the 'GEDI monthly bands' print — no
+ *     height/vegetation signal is included in this test-mode run.
  *   - Rule 6: does NOT add Sentinel-1 SAR or optical GLCM texture back in.
  *   - GEDI is explicitly treated as regional training data here, never as a
  *     per-site estimator (see header above and the immediate-next-task note
@@ -121,10 +127,13 @@ if (TEST_MODE) {
 // and more importantly it is a fixed ~2020 snapshot — the same "blind to
 // anything planted after the snapshot year" problem that ruled out the 2016
 // Meta/WRI CHM (CLAUDE.md rule 3). GEDI's own sensitivity/landsat_treecover/
-// pft_class covariates (selected directly from L4A below) stand in for now,
-// since they're contemporaneous with each shot. Revisit once we know
-// whether these covariates carry enough height/structure signal on their
-// own, or whether a genuinely current external height product is needed.
+// pft_class covariates were meant to stand in instead (contemporaneous with
+// each shot), but are currently commented out of the .select() in section 1
+// pending verification against the 'GEDI monthly bands' print below — so
+// this test-mode run carries no height/vegetation signal at all yet.
+// Revisit once we know whether these covariates carry enough signal on
+// their own, or whether a genuinely current external height product is
+// needed.
 // var CANOPY_HEIGHT_ASSET_ID =
 //   'projects/sat-io/open-datasets/ETH_GlobalCanopyHeight_2020_10m_v1';
 
@@ -134,6 +143,16 @@ if (TEST_MODE) {
 // checkpoint used. Coverage is March 2019 - March 2023 only (see header).
 var GEDI_COLLECTION_ID = 'LARSE/GEDI/GEDI04_A_002_MONTHLY';
 var S2_COLLECTION_ID = 'COPERNICUS/S2_SR_HARMONIZED';
+
+// One-time verification print: this asset's real band list. The earlier
+// 3.6M-shot checkpoint only ever selected 'agbd', so lat_lowestmode /
+// lon_lowestmode / shot_date_millis being invalid band names on this
+// gridded MONTHLY raster (they're footprint-TABLE columns, not raster
+// bands) went unnoticed until .select() on them made .sample() return
+// empty. This only inspects a single Image's metadata, not the ~3.6M
+// shot collection, so it's cheap — keep it for now while sensitivity/
+// landsat_treecover/pft_class below are still unverified against it.
+print('GEDI monthly bands:', ee.ImageCollection(GEDI_COLLECTION_ID).first().bandNames());
 
 // Years folded into the single multi-year post-monsoon/dry-season
 // composite below (section 2) — hardcoded to match GEDI04_A_002_MONTHLY's
@@ -182,10 +201,11 @@ var S2_BANDS = ['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B
 var EXPORT_FOLDER = 'carbon_stock_estimation';
 var EXPORT_FILE_PREFIX = 'gedi_l4a_s2_training_gujarat_maharashtra';
 
-// The only two prints in this script — both cheap: REGION is a small
-// client-side geometry, and the rest are plain JS config values, so
-// neither touches the GEDI shot collection or triggers any server
-// computation.
+// These two are also cheap: REGION is a small client-side geometry, and
+// the rest are plain JS config values — neither touches the GEDI shot
+// collection or triggers any server computation. (The GEDI band-names
+// print above is the third; the TEST_MODE row-count print near the export
+// is the fourth and only conditional one — see PERFORMANCE NOTE.)
 print('Region:', REGION);
 print('Config — biomass threshold (Mg/ha):', BIOMASS_THRESHOLD_MG_HA,
   '| low-tier sample size:', LOW_BIOMASS_SAMPLE_SIZE,
@@ -197,40 +217,29 @@ print('Config — biomass threshold (Mg/ha):', BIOMASS_THRESHOLD_MG_HA,
 // 1. GEDI L4A footprint-level shots, quality-filtered
 // =============================================================================
 
-// Keep only quality shots (spec: l4_quality_flag == 1, degrade_flag == 0),
-// and stamp each pixel with its source granule's acquisition date so that,
-// after mosaicking many orbits together, every surviving pixel still knows
-// exactly when it was collected.
-function qualityMaskAndDate(image) {
+// Keep only quality shots (spec: l4_quality_flag == 1, degrade_flag == 0).
+// No date band anymore — lat_lowestmode/lon_lowestmode/shot_date_millis
+// were all invalid on this gridded MONTHLY raster (see the band-names
+// print above and the CONFIG comment), and shot_date isn't needed for
+// anything now that per-shot time-matching is gone (see section 2).
+function qualityMask(image) {
   var quality = image.select('l4_quality_flag').eq(1)
     .and(image.select('degrade_flag').eq(0));
-  var dateBand = ee.Image.constant(image.date().millis())
-    .rename('shot_date_millis')
-    .toDouble();
-  return image.updateMask(quality).addBands(dateBand);
+  return image.updateMask(quality);
 }
 
 var gediRaw = ee.ImageCollection(GEDI_COLLECTION_ID)
   .filterBounds(REGION)
-  .map(qualityMaskAndDate);
+  .map(qualityMask);
 
-// GEDI covariates already present in L4A itself (sensitivity,
-// landsat_treecover, pft_class) stand in for an external height layer for
-// now — no separate L2A join needed.
-//
-// NOTE: GEDI_COLLECTION_ID is already a per-month mosaic (one image per
-// calendar month, not one per orbit granule), so where footprints from more
-// than one month land on the same ~25 m grid cell, the .mosaic() below picks
-// a single month's values for that pixel — shot_date_millis is therefore
-// approximate (month-level, not the exact original per-footprint date) in
-// those overlap cases. Acceptable for this first training run — shot_date
-// is carried through as an export column for reference only now (see
-// section 2: Sentinel-2 features are no longer per-shot time-matched);
-// flag for refinement later if exact per-footprint dates turn out to
-// matter.
+// sensitivity/landsat_treecover/pft_class are commented out until
+// verified against the 'GEDI monthly bands' print above — re-enable
+// (and add back to exportColumns in section 4) once confirmed present.
 var gediMosaic = gediRaw
-  .select(['agbd', 'agbd_se', 'lat_lowestmode', 'lon_lowestmode', 'shot_date_millis',
-    'sensitivity', 'landsat_treecover', 'pft_class'])
+  .select([
+    'agbd', 'agbd_se'
+    // , 'sensitivity', 'landsat_treecover', 'pft_class'
+  ])
   .mosaic();
 
 // GEDI footprints are rasterized at ~25 m in this asset with all in-between
@@ -243,14 +252,14 @@ var gediShots = gediMosaic.sample({
   tileScale: 16
 });
 
-// Carry shot_date/lat/lon through as human-readable export columns. No
-// per-shot season_year tag anymore — see section 2 for why.
+// lat/lon come from each sampled feature's own geometry (populated because
+// geometries: true above), not from nonexistent lat_lowestmode/
+// lon_lowestmode bands.
 gediShots = gediShots.map(function(f) {
-  var d = ee.Date(f.get('shot_date_millis'));
+  var c = f.geometry().coordinates();
   return f.set({
-    shot_date: d.format('YYYY-MM-dd'),
-    lat: f.get('lat_lowestmode'),
-    lon: f.get('lon_lowestmode')
+    lon: c.get(0),
+    lat: c.get(1)
   });
 });
 
@@ -433,8 +442,10 @@ if (TEST_MODE) {
   print('TEST row count:', training.limit(500).size());
 }
 
-var exportColumns = ['agbd', 'agbd_se', 'shot_date', 'lat', 'lon',
-    'sensitivity', 'landsat_treecover', 'pft_class',
+// sensitivity/landsat_treecover/pft_class dropped from selectors along with
+// the .select() in section 1 above — add back together once verified.
+var exportColumns = ['agbd', 'agbd_se', 'lat', 'lon',
+    // 'sensitivity', 'landsat_treecover', 'pft_class',
     'ndvi_postmonsoon', 'evi_postmonsoon', 'ndvi_dryseason', 'evi_dryseason']
   .concat(S2_BANDS);
 
