@@ -1,0 +1,5 @@
+# Model artifacts that can be huge (e.g. deep/unpruned Random Forests) —
+# too large for a normal git push (GitHub hard-rejects files > 100 MB).
+# Regenerate via src/train_biomass_model.py rather than committing these.
+outputs/*.joblib
+outputs/*.pkl
