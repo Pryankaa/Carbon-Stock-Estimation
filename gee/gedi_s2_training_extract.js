@@ -57,44 +57,48 @@
  * Output: for the real regional run, one CSV per tile (64 export tasks,
  * same Drive folder, filenames suffixed _tile_i_j — see section 3); for
  * TEST_MODE, one CSV over the small test box. Every CSV has the same
- * columns: one row per quality GEDI shot in that tile/region (ALL of
- * them — no biomass filtering or capping, see the imbalance note above),
- * agbd, agbd_se, lat, lon (derived from each sampled feature's own
- * geometry — lat_lowestmode/lon_lowestmode are footprint-TABLE columns,
- * not bands on this gridded MONTHLY raster, and selecting them made
- * .sample() return empty; see CONFIG and section 1), and Sentinel-2
- * post-monsoon/dry-season NDVI + EVI plus reflectance bands B2-B12 (B10
- * excluded: it is an L1C-only cirrus band, not present in the L2A
- * surface-reflectance product) — all from ONE multi-year composite,
- * shared across every tile and every shot regardless of its date (see
- * NOTE above and section 2). No shot_date column (dropped along with
- * per-shot time-matching) and no sensitivity/landsat_treecover/pft_class
- * for now — commented out in section 1 pending verification against the
- * 'GEDI monthly bands' print.
+ * columns: one row per quality- AND height-filtered GEDI shot in that
+ * tile/region (ALL of them — no biomass filtering or capping, see the
+ * imbalance note above), agbd, agbd_se, lat, lon (derived from each
+ * sampled feature's own geometry — lat_lowestmode/lon_lowestmode are
+ * footprint-TABLE columns, not bands on this gridded MONTHLY raster, and
+ * selecting them made .sample() return empty; see CONFIG and section 1),
+ * rh50/rh75/rh90/rh98 (GEDI L2A relative height, see section 1's JOIN
+ * STRATEGY), and Sentinel-2 post-monsoon/dry-season NDVI + EVI plus
+ * reflectance bands B2-B12 (B10 excluded: it is an L1C-only cirrus band,
+ * not present in the L2A surface-reflectance product) — all from ONE
+ * multi-year composite, shared across every tile and every shot
+ * regardless of its date (see NOTE above and section 2). No shot_date
+ * column (dropped along with per-shot time-matching) and no
+ * sensitivity/landsat_treecover/pft_class for now — commented out in
+ * section 1 pending verification against the 'GEDI L4A monthly bands'
+ * print.
  *
- * External canopy-height sampling is DISABLED for this first run — see the
- * TODO in the CONFIG section below.
+ * External (non-GEDI) canopy-height sampling is DISABLED — see the TODO
+ * in the CONFIG section below. GEDI's own rh bands (added below) are the
+ * height signal now.
  *
- * IN PROGRESS: CEPT ground-truth validation (src/validate_cept_ground_truth.py)
+ * HEIGHT ADDED: CEPT ground-truth validation (src/validate_cept_ground_truth.py)
  * found the trained model's per-cell predictions have a NEGATIVE Spearman
  * correlation (-0.28) against field biomass, despite a decent site-total
  * match (+14%) — almost certainly because optical-only features can't
  * distinguish tall-and-green (trees) from flat-and-green (lawns/crops).
- * Section 1 below now scaffolds joining GEDI L2A relative-height (rh)
- * shots onto L4A biomass shots by shot_number, to add the missing
- * structure signal. That join is NOT active yet — it's gated behind
- * verifying real L2A band names first (see the print statements in
- * CONFIG and the TODOs in section 1). Output/exportColumns are UNCHANGED
- * from before until that verification happens.
+ * Section 1 below now attaches GEDI L2A relative-height bands (rh50,
+ * rh75, rh90, rh98) to each L4A biomass shot. shot_number doesn't exist
+ * on either gridded monthly asset, so the join is by system:index instead
+ * (L4A and L2A monthly rasters share a common origin — same granules,
+ * same grid — which is what makes that sound; see JOIN STRATEGY in
+ * section 1). TEST_MODE is on: confirm the join yields populated rh
+ * values on the small box before running the full 64-tile export.
  *
  * CLAUDE.md rules this script follows:
  *   - Rule 3: does NOT use the Meta/WRI ~2016 canopy height model (blind to
  *     anything planted after 2016). The external ~2020 replacement is
  *     disabled too for the same reason (see TODO below). GEDI's own
- *     sensitivity/landsat_treecover/pft_class covariates were meant to
- *     stand in instead, but are temporarily commented out in section 1
- *     pending verification against the 'GEDI monthly bands' print — no
- *     height/vegetation signal is included in exports until re-enabled.
+ *     rh50/rh75/rh90/rh98 (L2A, section 1) are the height signal instead
+ *     — contemporaneous with each shot, unlike a fixed-year external CHM.
+ *     sensitivity/landsat_treecover/pft_class (L4A covariates) are a
+ *     separate, still-unverified addition, commented out in section 1.
  *   - Rule 6: does NOT add Sentinel-1 SAR or optical GLCM texture back in.
  *   - GEDI is explicitly treated as regional training data here, never as a
  *     per-site estimator (see header above and the immediate-next-task note
@@ -138,7 +142,7 @@
 // test of the real export path. Workflow: run the export with
 // TEST_MODE = true, check the resulting CSV has rows, THEN set
 // TEST_MODE = false and run the real regional export.
-var TEST_MODE = false;
+var TEST_MODE = true; // confirming the L4A/L2A height join on the small box before the full 64-tile run
 
 // Placeholder region: Gujarat/Maharashtra, ~20-24 N, 72-76 E. Replace with
 // the real regional bounding box before running. Kept as plain JS numbers
@@ -252,40 +256,40 @@ print('Config — TEST_MODE:', TEST_MODE,
   '| tile grid:', TEST_MODE ? 'n/a (single small-box export)' : (TILE_GRID_SIZE + 'x' + TILE_GRID_SIZE));
 
 // =============================================================================
-// 1. GEDI L4A biomass + L2A height, quality-filtered and joined by
-//    shot_number
+// 1. GEDI L4A biomass + L2A height, quality-filtered and linked by
+//    system:index
 // =============================================================================
 //
 // JOIN STRATEGY (see also the header note above):
-// L4A and L2A monthly assets are independently-built raster mosaics, so a
-// shot's biomass (L4A) and height (L2A) CANNOT be paired by pixel/spatial
-// proximity without risking exactly what sank the earlier rh98/rh100
-// attempt in this script's history: two shots from different orbit passes
-// landing on the same ~25 m grid cell, mosaicked independently, giving a
-// biomass value and a height value that were never actually the same
-// physical shot. Instead: sample L4A and L2A separately (each already
-// quality-masked by its own flags), then ee.Join.inner() the two
-// resulting FeatureCollections on shot_number — an exact property match,
-// not a spatial guess. Shots that pass only one product's quality flags
-// are correctly dropped by the inner join.
+// shot_number does NOT exist as a band on either gridded monthly asset
+// (confirmed via the 'GEDI L4A/L2A monthly bands' prints above) — it's
+// standard on the raw per-shot table products, but those aren't usable
+// here (the "found IndexedFolder" problem, see GEDI_COLLECTION_ID
+// comment below). So the exact-shot join isn't possible. Instead: L4A and
+// L2A monthly rasters are built from the SAME GEDI granules on the SAME
+// grid, so linking the two ImageCollections by system:index (the same
+// mechanism already used for Cloud Score+ in section 2) means that for
+// any given pixel, biomass and height come from the SAME source monthly
+// image — not two independently-mosaicked collections that could each
+// pick a different orbit pass for that grid cell. That shared origin is
+// exactly what makes this join sound despite not having shot_number.
 //
-// GEDI_SHOT_NUMBER_BAND and GEDI_L2A_RH_BANDS below are UNVERIFIED
-// placeholders. Do not uncomment/use them until the 'GEDI L4A/L2A monthly
-// bands' prints above confirm: (a) shot_number actually exists as a band
-// on both gridded monthly assets (it's standard on the raw per-shot
-// table products, but those aren't usable here — see the
-// GEDI_COLLECTION_ID comment below), and (b) it's stored with enough
-// precision (int64/float64, not float32) that two independently-sampled
-// copies will match exactly. If shot_number turns out not to be viable,
-// the fallback is linking the two monthly ImageCollections by
-// system:index (same mechanism already used for Cloud Score+ below in
-// section 2) — a weaker guarantee ("same source month/pixel", not
-// "same physical shot"), only to be used if this primary plan fails.
-
-// TODO(verify): confirm exact name + dtype via the band-name prints above
-// before uncommenting anything below that references these.
-// var GEDI_SHOT_NUMBER_BAND = 'shot_number';
-// var GEDI_L2A_RH_BANDS = ['rh50', 'rh75', 'rh90', 'rh98', 'rh100'];
+// L2A's rh bands are quality-masked with L2A's OWN flags (quality_flag,
+// degrade_flag -- named without the "l4_" prefix) BEFORE linking, so a
+// low-quality L2A shot's height never rides along with a good L4A shot's
+// biomass. After linking, agbd/agbd_se still carry L4A's mask and the
+// linked rh bands still carry L2A's mask (per-band masks survive
+// linkCollection); combineMasks() below explicitly ANDs the two into one
+// mask applied to every band, so a shot only survives if it passed BOTH
+// products' quality checks. Combined shot count will be somewhat lower
+// than L4A-only -- that's correct: a biomass value with no trustworthy
+// height paired to it isn't useful for this feature set, not a bug.
+//
+// rh50/rh75/rh90/rh98 chosen (not all 101 rh0-rh100 percentiles): a few
+// points along the vertical profile plus rh98 (~canopy top) is enough
+// structure signal to tell tall-and-green (trees) from flat-and-green
+// (lawns/crops) without dragging in a huge, mostly-redundant band set.
+var RH_BANDS = ['rh50', 'rh75', 'rh90', 'rh98'];
 
 // GEDI04_A_002 (footprint-level) is a table/index folder in this GEE asset,
 // not an ImageCollection — loading it directly throws "found IndexedFolder".
@@ -300,15 +304,6 @@ print('Config — TEST_MODE:', TEST_MODE,
 var GEDI_L4A_BANDS_NEEDED = [
   'agbd', 'agbd_se', 'l4_quality_flag', 'degrade_flag'
   // , 'sensitivity', 'landsat_treecover', 'pft_class'
-  // , GEDI_SHOT_NUMBER_BAND
-];
-
-// L2A has its OWN quality/degrade flags (named without the "l4_" prefix) —
-// a shot can pass one product's quality check and fail the other's.
-var GEDI_L2A_BANDS_NEEDED = [
-  'quality_flag', 'degrade_flag'
-  // , GEDI_SHOT_NUMBER_BAND
-  // .concat(GEDI_L2A_RH_BANDS) once verified
 ];
 
 function qualityMaskL4A(image) {
@@ -328,30 +323,43 @@ var gediL4ARaw = ee.ImageCollection(GEDI_COLLECTION_ID)
   .select(GEDI_L4A_BANDS_NEEDED)
   .map(qualityMaskL4A);
 
-// Quality flags have done their job (masking) — drop them here so only
-// the actual training-data bands reach mosaic/sample.
-var gediL4AMosaic = gediL4ARaw
-  .select([
-    'agbd', 'agbd_se'
-    // , 'sensitivity', 'landsat_treecover', 'pft_class'
-    // , GEDI_SHOT_NUMBER_BAND
-  ])
-  .mosaic();
-
+// L2A quality-masked BEFORE linking (see JOIN STRATEGY above) — narrowed
+// to just the rh bands plus its own quality flags, same
+// narrow-bands-first performance discipline as L4A.
 var gediL2ARaw = ee.ImageCollection(GEDI_L2A_COLLECTION_ID)
   .filterBounds(REGION)
-  .select(GEDI_L2A_BANDS_NEEDED)
+  .select(RH_BANDS.concat(['quality_flag', 'degrade_flag']))
   .map(qualityMaskL2A);
 
-// var gediL2AMosaic = gediL2ARaw
-//   .select([GEDI_SHOT_NUMBER_BAND].concat(GEDI_L2A_RH_BANDS))
-//   .mosaic();
-// ^ disabled until GEDI_SHOT_NUMBER_BAND / GEDI_L2A_RH_BANDS are verified.
+// Attach L2A's (already quality-masked) rh bands onto each L4A image by
+// matching system:index.
+var gediLinked = gediL4ARaw.linkCollection(gediL2ARaw, RH_BANDS);
+
+// AND the two independent per-band masks (L4A's on agbd, L2A's carried
+// over on the rh bands) into one mask covering every band -- see JOIN
+// STRATEGY above. rh50 stands in for all four rh bands here since they
+// all came from the same L2A source image and therefore already share
+// one identical mask.
+function combineMasks(image) {
+  var bothQualityOk = image.select('agbd').mask().and(image.select('rh50').mask());
+  return image.updateMask(bothQualityOk);
+}
+var gediCombined = gediLinked.map(combineMasks);
+
+// Quality flags (L4A's) have done their job (masking) — drop them here so
+// only the actual training-data bands reach mosaic/sample.
+var gediMosaic = gediCombined
+  .select(
+    ['agbd', 'agbd_se']
+      // .concat(['sensitivity', 'landsat_treecover', 'pft_class']) -- once verified
+      .concat(RH_BANDS)
+  )
+  .mosaic();
 
 // GEDI footprints are rasterized at ~25 m in these assets with all
 // in-between pixels masked out, so sampling on the native grid and
-// dropping masked pixels recovers exactly the quality shot list (one
-// feature per footprint).
+// dropping masked pixels recovers exactly the quality- (and height-)
+// filtered shot list (one feature per footprint).
 //
 // Samples within `geom` only (a tile, or REGION directly in TEST_MODE) —
 // NOT the whole region in one call. A single .sample() over the full
@@ -364,38 +372,19 @@ var gediL2ARaw = ee.ImageCollection(GEDI_L2A_COLLECTION_ID)
 // happens ONCE in Python after combining the tile CSVs (see CLAUDE.md and
 // the header NOTE above) rather than per tile here.
 function sampleGediShots(geom) {
-  var l4aShots = gediL4AMosaic.sample({
+  var shots = gediMosaic.sample({
     region: geom,
     scale: 25,
     geometries: true,
     tileScale: 16
   });
-  l4aShots = l4aShots.map(function(f) {
+  return shots.map(function(f) {
     var c = f.geometry().coordinates();
     return f.set({
       lon: c.get(0),
       lat: c.get(1)
     });
   });
-
-  // TODO(activate once verified): join l4aShots to L2A height shots by
-  // shot_number here, e.g.:
-  //
-  // var l2aShots = gediL2AMosaic.sample({
-  //   region: geom, scale: 25, geometries: false, tileScale: 16
-  // });
-  // var shotNumberFilter = ee.Filter.equals({
-  //   leftField: GEDI_SHOT_NUMBER_BAND, rightField: GEDI_SHOT_NUMBER_BAND
-  // });
-  // var joined = ee.Join.inner().apply(l4aShots, l2aShots, shotNumberFilter);
-  // return joined.map(function(pair) {
-  //   var l4a = ee.Feature(pair.get('primary'));
-  //   var l2a = ee.Feature(pair.get('secondary'));
-  //   return l4a.copyProperties(l2a, GEDI_L2A_RH_BANDS);
-  // });
-  //
-  // For now (height join not yet active), return L4A shots unchanged:
-  return l4aShots;
 }
 
 // =============================================================================
@@ -501,11 +490,15 @@ var seasonalComposite = postMonsoonIndices
 //    for the full region, a single task for TEST_MODE
 // =============================================================================
 
-// sensitivity/landsat_treecover/pft_class dropped from selectors along with
-// the .select() in section 1 above — add back together once verified.
-var exportColumns = ['agbd', 'agbd_se', 'lat', 'lon',
+// rh50/rh75/rh90/rh98 (GEDI L2A height, section 1) added as features.
+// sensitivity/landsat_treecover/pft_class still dropped from selectors
+// along with the .select() in section 1 above — add back together once
+// verified.
+var exportColumns = ['agbd', 'agbd_se', 'lat', 'lon']
+  .concat(RH_BANDS)
+  .concat([
     // 'sensitivity', 'landsat_treecover', 'pft_class',
-    'ndvi_postmonsoon', 'evi_postmonsoon', 'ndvi_dryseason', 'evi_dryseason']
+    'ndvi_postmonsoon', 'evi_postmonsoon', 'ndvi_dryseason', 'evi_dryseason'])
   .concat(S2_BANDS);
 
 // Samples every quality-filtered GEDI shot in `geom` against the one
