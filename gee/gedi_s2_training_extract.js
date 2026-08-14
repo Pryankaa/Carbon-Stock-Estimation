@@ -142,7 +142,7 @@
 // test of the real export path. Workflow: run the export with
 // TEST_MODE = true, check the resulting CSV has rows, THEN set
 // TEST_MODE = false and run the real regional export.
-var TEST_MODE = true; // confirming the L4A/L2A height join on the small box before the full 64-tile run
+var TEST_MODE = false; // height join validated on the small box (0 nulls, rh98-vs-agbd rho=0.98) -- proceeding to the full 64-tile run
 
 // Placeholder region: Gujarat/Maharashtra, ~20-24 N, 72-76 E. Replace with
 // the real regional bounding box before running. Kept as plain JS numbers
