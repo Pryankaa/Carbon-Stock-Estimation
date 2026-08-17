@@ -1,0 +1,52 @@
+{
+  "form": "agbd = a * rh98^b",
+  "fit_method": "nonlinear least squares in raw space (scipy.optimize.curve_fit, method=trf) -- NOT log-log linearization, see module docstring CLAUDE.md rule 1 note",
+  "target_column": "agbd",
+  "height_column": "rh98",
+  "a": 0.5325761641071665,
+  "b": 1.8306608979485377,
+  "spatial_cv_summary": {
+    "r2": {
+      "mean": 0.9222601002651482,
+      "std": 0.02582485109887509,
+      "min": 0.8641461321876747,
+      "max": 0.9724760136127435
+    },
+    "rmse": {
+      "mean": 18.933482575130594,
+      "std": 4.785493291304379,
+      "min": 9.181226183016399,
+      "max": 26.571951852539616
+    },
+    "pred_sum_over_actual_sum": {
+      "mean": 1.0215234027543372,
+      "std": 0.031838052833343795,
+      "min": 0.9733551001304713,
+      "max": 1.0887230572327842
+    }
+  },
+  "lookup_table": {
+    "10": {
+      "point_estimate_Mg_ha": 36.06140332848796,
+      "median_Mg_ha": 35.83189271681469,
+      "mean_Mg_ha": 35.6699203730682,
+      "p2_5_Mg_ha": 33.15101738121415,
+      "p97_5_Mg_ha": 38.50246644341086
+    },
+    "20": {
+      "point_estimate_Mg_ha": 128.27040484213242,
+      "median_Mg_ha": 128.51230913667948,
+      "mean_Mg_ha": 128.3973405441407,
+      "p2_5_Mg_ha": 124.89564940118147,
+      "p97_5_Mg_ha": 131.69197495489433
+    },
+    "30": {
+      "point_estimate_Mg_ha": 269.457234289359,
+      "median_Mg_ha": 270.7350728036365,
+      "mean_Mg_ha": 271.8528576234079,
+      "p2_5_Mg_ha": 257.54244157359807,
+      "p97_5_Mg_ha": 287.01656100116674
+    }
+  },
+  "n_bootstrap": 200
+}
