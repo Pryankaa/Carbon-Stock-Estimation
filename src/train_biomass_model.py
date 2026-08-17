@@ -1,12 +1,27 @@
 """
 Train a Random Forest to predict GEDI-derived biomass (agbd, Mg/ha) from
-Sentinel-2 features, and validate with spatial block cross-validation.
+GEDI relative-height (rh) bands plus Sentinel-2 features, and validate
+with spatial block cross-validation.
 
 This is the "trained model" approach (see CLAUDE.md: ~±6% on site total at
 CEPT, but needs field plots at every new site — here GEDI shots stand in
 for field plots, per the GEDI-as-training-data strategy in
 gee/gedi_s2_training_extract.js). This script only trains and validates;
 it does not apply the model anywhere.
+
+HEIGHT ADDED: the first version of this model (optical-only) validated
+against CEPT's field census with a decent site-total match (+14%) but a
+NEGATIVE per-cell Spearman correlation (-0.28) — optical features alone
+can't distinguish tall-and-green (trees) from flat-and-green (lawns/
+crops). gee/gedi_s2_training_extract.js now joins GEDI L2A relative-
+height bands (rh50, rh75, rh90, rh98) onto each training shot; rh98
+alone correlates with agbd at Spearman +0.97 region-wide (vs. +0.43 for
+NDVI), so height is expected to dominate the feature importances below.
+
+RF_PARAMS is now capped (n_estimators=200, max_depth=20): the earlier
+uncapped 500-tree model produced a 2.66 GB .joblib, far past what git can
+hold. Capping trades a small amount of accuracy for a file small enough
+to version-control.
 
 CLAUDE.md rules followed:
   - Rule 1 (raw kg/Mg, never log): agbd is used as-is, in raw Mg/ha. No
@@ -50,12 +65,13 @@ from sklearn.metrics import mean_squared_error, r2_score
 # =============================================================================
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TRAINING_DATA_PATH = REPO_ROOT / "data" / "processed" / "gedi_s2_training_stratified.csv"
+TRAINING_DATA_PATH = REPO_ROOT / "data" / "processed" / "gedi_s2_training_WITHHEIGHT.csv"
 MODEL_OUTPUT_PATH = REPO_ROOT / "outputs" / "biomass_rf_model.joblib"
 METRICS_OUTPUT_PATH = REPO_ROOT / "outputs" / "biomass_rf_spatial_cv_metrics.json"
 
 TARGET_COLUMN = "agbd"  # raw Mg/ha -- CLAUDE.md rule 1, never log-transformed
 FEATURE_COLUMNS = [
+    "rh50", "rh75", "rh90", "rh98",
     "ndvi_postmonsoon", "evi_postmonsoon", "ndvi_dryseason", "evi_dryseason",
     "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12",
 ]
@@ -63,14 +79,19 @@ FEATURE_COLUMNS = [
 # without GEDI at inference time), lat/lon (used only to build spatial CV
 # blocks below, not as model inputs -- see no-leakage notes above).
 
-# Spatial block cross-validation (CLAUDE.md rule 2).
+# Spatial block cross-validation (CLAUDE.md rule 2). Unchanged from the
+# optical-only run, so the two are directly comparable.
 BLOCK_SIZE_DEG = 0.25
 N_SPATIAL_FOLDS = 5
 N_SHIFT_ORIGINS = 4  # repeats with shifted block-grid origin, for an honest uncertainty band
 RANDOM_SEED = 42
 
+# n_estimators/max_depth capped -- the earlier uncapped 500-tree model
+# produced a 2.66 GB .joblib, far past GitHub's 100 MB push limit. See
+# module docstring.
 RF_PARAMS = dict(
-    n_estimators=500,
+    n_estimators=200,
+    max_depth=20,
     random_state=RANDOM_SEED,
     n_jobs=-1,
 )
@@ -201,7 +222,11 @@ def main():
 
     MODEL_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump({"model": final_model, "feature_columns": FEATURE_COLUMNS}, MODEL_OUTPUT_PATH)
-    print(f"\nSaved trained model to {MODEL_OUTPUT_PATH}")
+    model_size_mb = MODEL_OUTPUT_PATH.stat().st_size / (1024 * 1024)
+    print(f"\nSaved trained model to {MODEL_OUTPUT_PATH} ({model_size_mb:.1f} MB)")
+    if model_size_mb > 100:
+        print(f"WARNING: {model_size_mb:.1f} MB is still over GitHub's 100 MB push limit -- "
+              f"stays gitignored (outputs/*.joblib), not committed.")
 
     metrics_out = {
         "config": {
