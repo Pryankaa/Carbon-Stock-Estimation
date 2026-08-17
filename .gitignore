@@ -3,3 +3,7 @@
 # Regenerate via src/train_biomass_model.py rather than committing these.
 outputs/*.joblib
 outputs/*.pkl
+
+# Python bytecode cache
+__pycache__/
+*.pyc
