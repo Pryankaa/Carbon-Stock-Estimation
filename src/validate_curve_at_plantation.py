@@ -46,7 +46,7 @@ POWER_LAW_PATH = REPO_ROOT / "outputs" / "height_biomass_power_law.json"
 # current biomass number (see the caveat printed at runtime).
 # -----------------------------------------------------------------------
 SITE_NAME = "botanical"
-SITE_AREA_HA = 1.8  # approximate, as given
+SITE_AREA_HA = 1.820407571906957  # data/boundaries/Botanical_boundary.geojson Area_Ha
 SITE_HEIGHT_CSV = REPO_ROOT / "data" / "raw" / "botanical_canopy_height_validation.csv"
 OUTPUT_PATH = REPO_ROOT / "outputs" / f"{SITE_NAME}_curve_validation_per_point.csv"
 
