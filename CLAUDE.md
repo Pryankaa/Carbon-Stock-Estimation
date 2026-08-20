@@ -24,8 +24,15 @@ Three approaches were built and validated:
    field plots at every new site.
 2. **Zero-calibration allometry** (published coefficients × canopy cover) — ~±35%, no
    fieldwork, but depends on a canopy height model.
-3. **GEDI L4A direct biomass** — reads biomass straight from spaceborne LiDAR, no
-   allometry. This is the current focus because it works on sites planted after 2016.
+3. **GEDI-calibrated height→biomass power law** (`agbd = 0.5326 × rh98^1.8307`, spatial-CV
+   R² 0.92) — GEDI calibrates this curve ONCE, regionally; it is never used at a
+   prediction site. At any real site, height instead comes from a published canopy height
+   map (Tier 1, mature sites) or a drone flight (Tier 2, young sites), and the curve
+   converts that height to biomass. This is the current deployable engine. Validated
+   regionally (Spearman 0.94, +10% bias) and sanity-checked on a real plantation site
+   (Botanical, ±30–40%); under-predicts by 73% at CEPT specifically because CEPT's dense
+   heritage exotic species are an outlier relative to the regional training vegetation —
+   not a general method failure. Full write-up: `docs/METHOD.md`.
 
 ## HARD-WON RULES — do not relearn these
 
@@ -71,6 +78,14 @@ suggestions.
    each tile's low-biomass majority and under-represent rare high-biomass shots relative to
    the combined dataset — stratify once, in Python, after combining the tile CSVs. Do not
    re-add biomass thresholding/capping to the GEE script.
+
+9. **Sentinel-2 optical is dropped from the biomass model.** Tested against height-based
+   biomass at a fixed canopy height and found no usable signal (Spearman rho ~0.05) —
+   optical reflectance saturates over closed canopy and cannot separate a tall dense stand
+   from a tall sparse one. The deployable engine is the two-coefficient GEDI-calibrated
+   power law (`agbd = a × rh98^b`, see rule 3 above and `docs/METHOD.md`), driven by height
+   alone. Do not re-add Sentinel-2 bands/indices as biomass predictors without new evidence
+   of signal at a new site.
 
 ## Immediate next task
 
