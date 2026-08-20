@@ -1,0 +1,8 @@
+{
+"type": "FeatureCollection",
+"name": "Jagadiya_boundary",
+"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
+"features": [
+{ "type": "Feature", "properties": { "fid": 31.0, "Site_Name": "Jagadiya", "Project_ID": "JAG", "Area_Ha": 0.74697601513788103, "Unit_Type": "Boundary", "Strata_ID": null, "Strata_Typ": null, "Carbon_Inc": null, "Density_Cl": null, "Dominant_S": null, "Baseline_Y": 2023, "Monitoring": 2026 }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 73.192562581866, 21.635604672642032 ], [ 73.193193991546991, 21.635710931253957 ], [ 73.193537377655304, 21.635802824415766 ], [ 73.193541470677488, 21.635764828358802 ], [ 73.193623477300477, 21.635003544408132 ], [ 73.193016146092049, 21.634847747868371 ], [ 73.192768184667855, 21.635265317682961 ], [ 73.192766574621217, 21.635268029009708 ], [ 73.1925940058712, 21.635552814598391 ], [ 73.192562581866, 21.635604672642032 ] ] ] } }
+]
+}
